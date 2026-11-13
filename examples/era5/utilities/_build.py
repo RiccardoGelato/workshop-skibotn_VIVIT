@@ -898,10 +898,163 @@ graph; nothing about the objects changes."""
     ]
 )
 
+# 4 --------------------------------------------------------------------------------------
+many_graphs = notebook(
+    [
+        new_markdown_cell(
+            """\
+# 4 — Sample several graphs from one date, train on all of them, infer on another
+
+One date is one graph, but `train` also takes a list. Here the training set is **four random
+subsets of the 2018-01-01 grid points**, each a `Data` with its own nodes and its own edges, and the
+trained model is then applied to the **complete 2019-08-01 graph** — a date it never saw.
+
+An epoch is one optimizer step per graph, so `epochs=200` over four graphs is 800 steps; the
+reported `train_loss`/`val_loss` are the means over those graphs."""
+        ),
+        new_code_cell(SHARED),
+        new_markdown_cell(
+            """\
+## Sample subgraphs from the first date
+
+Each subgraph keeps a random `FRACTION` of the grid points, drawn with its own seed: same radius,
+fewer points, so about 3% of the kept nodes end up with no neighbour inside their own subgraph.
+They are not broken — a node with no incoming edge is embedded from its own features through the
+root weight — but they carry no neighbourhood information, which is why the in-degree is printed
+rather than assumed."""
+        ),
+        new_code_cell(
+            """\
+from graph_utils import merge_queries, radius_edges
+
+STRIDE = 8
+# Chord on the unit sphere: a 2.5 degree arc, the same neighbourhood as notebooks 1-3.
+RADIUS = 0.04363
+FRACTION = 0.5
+NUM_GRAPHS = 4
+
+graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
+features, latitudes, longitudes = graph.load("2018-01-01")
+positions = graph.positions(latitudes, longitudes)
+flat = features.reshape(-1, features.shape[2])
+print(f"{flat.shape[0]} grid points on 2018-01-01, {flat.shape[1]} variables each")
+
+
+def sample_graph(seed: int):
+    \"\"\"A random subset of the grid points, with a radius neighbourhood of its own.\"\"\"
+    keep = np.random.default_rng(seed).random(flat.shape[0]) < FRACTION
+    return merge_queries(
+        positions[keep],
+        flat[keep],
+        edge_builder=lambda pos, sources, targets: radius_edges(
+            pos, RADIUS, sources=sources, targets=targets
+        ),
+    )
+
+
+graphs = [sample_graph(seed) for seed in range(NUM_GRAPHS)]
+for index, sampled in enumerate(graphs):
+    degrees = torch.bincount(sampled.edge_index[1], minlength=sampled.num_nodes)
+    print(
+        f"graph {index}: {sampled.num_nodes} nodes, {sampled.num_edges} edges, "
+        f"mean in-degree {degrees.float().mean():.2f}, isolated {int((degrees == 0).sum())}"
+    )
+"""
+        ),
+        new_markdown_cell(
+            """\
+## Train on the list
+
+`train` runs one optimizer step per graph per epoch and averages the losses it reports. `loss` on a
+list is the unweighted mean over graphs, so it equals the mean of the per-graph scores below —
+`loss([a, b, c, d]) == mean(loss(a), loss(b), loss(c), loss(d))`."""
+        ),
+        new_code_cell(
+            """\
+CONFIG = {
+    "width": 8,
+    "ker_width": 32,
+    "epochs": 200,
+    "seed": 0,
+    "early_stopping": True,
+    "verbose": True,
+    "log_every": 25,
+    "nystrom": 0.25,
+}
+
+model = NOFE(dim=3, config=CONFIG)
+history = model.train(graphs)
+per_graph = [model.loss(sampled) for sampled in graphs]
+print(f"{len(history)} epochs, {len(history) * len(graphs)} optimizer steps")
+print(f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f}")
+print("mean KL per graph:", [round(value, 6) for value in per_graph])
+print(f"mean KL over the list: {model.loss(graphs):.6f}")
+assert abs(model.loss(graphs) - np.mean(per_graph)) < 1e-6
+"""
+        ),
+        new_markdown_cell(
+            """\
+## Infer on the second date, fully observed
+
+`embed` stays single-graph: it is handed the complete 2019-08-01 network and returns one row per
+node. The only compatibility requirement is matching widths — 11 input features and `2P + 1 = 7`
+edge channels — which `Era5Graph` reproduces for any date at this stride."""
+        ),
+        new_code_cell(
+            """\
+infer_graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
+infer_features, infer_latitudes, infer_longitudes = infer_graph.load("2019-08-01")
+full = infer_graph.build(infer_features, infer_latitudes, infer_longitudes)
+
+embedding = model.embed(full)
+print("embedding on 2019-08-01:", tuple(embedding.shape))
+print(f"mean KL on the unseen date: {model.loss(full):.6f}")
+assert embedding.shape == (full.num_nodes, 3)
+assert torch.isfinite(embedding).all()
+"""
+        ),
+        new_markdown_cell(
+            """\
+## Plot the embedding of the unseen date
+
+R/G/B are the three embedding dimensions, one `pcolormesh` quad per grid point, scaled by the
+5th/95th percentile spread (`era5.PERCENTILE`)."""
+        ),
+        new_code_cell(
+            """\
+import cartopy.crs as ccrs
+import matplotlib.pyplot as plt
+
+figure, axis = plt.subplots(
+    1, 1, figsize=(12.0, 6.5), subplot_kw={"projection": ccrs.PlateCarree()}
+)
+axis.set_global()
+era5.draw_globe(axis, infer_latitudes, infer_longitudes, embedding.numpy())
+axis.coastlines(linewidth=0.5)
+axis.set_title(f"2019-08-01, never trained on: {full.num_nodes} nodes")
+plt.show()
+"""
+        ),
+        new_markdown_cell(
+            """\
+## Takeaways
+
+|Fact|Why it matters|
+|---|---|
+|`train` takes a list|One operator covers many graphs; an epoch is one step per graph|
+|Graphs need only matching widths|The samples are independent `Data` objects with their own edges|
+|`loss` on a list is a mean over graphs|Each graph counts once, whatever its node count|
+|`embed` takes one graph|Inference loop over the list if many embeddings are needed|"""
+        ),
+    ]
+)
+
+
 NOTEBOOKS = (
     ("1-in-sample.ipynb", in_sample),
     ("2-held-out-training.ipynb", held_out),
     ("3-transfer-between-dates.ipynb", transfer),
+    ("4-many-graphs.ipynb", many_graphs),
 )
 
 if __name__ == "__main__":

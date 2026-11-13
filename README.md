@@ -334,6 +334,10 @@ reproducible run to run.
 
 A single `Data` behaves exactly as before: one graph reduces to today's seeds and one step per epoch.
 
+`examples/era5/notebooks/4-many-graphs.ipynb` works the whole pattern through: four random
+subgraphs of one ERA5 date, one model trained on the list, embedded on the full graph of a second
+date.
+
 ### Choosing between them
 
 | Situation | Workflow |
