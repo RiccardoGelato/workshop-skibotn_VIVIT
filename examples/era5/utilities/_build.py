@@ -906,8 +906,10 @@ many_graphs = notebook(
 # 4 — Sample several graphs from one date, train on all of them, infer on another
 
 One date is one graph, but `train` also takes a list. Here the training set is **four random
-subsets of the 2018-01-01 grid points**, each a `Data` with its own nodes and its own edges, and the
-trained model is then applied to the **complete 2019-08-01 graph** — a date it never saw.
+subsets of the 2018-01-01 grid points at stride `STRIDE`**, each a `Data` with its own nodes and
+its own edges; the trained model is then applied to the **complete 2019-08-01 field at native
+stride 1** — 1,035,360 locations of a date it never saw, on a grid finer than anything it trained
+on.
 
 An epoch is one optimizer step per graph, so `epochs=200` over four graphs is 800 steps; the
 reported `train_loss`/`val_loss` are the means over those graphs."""
@@ -994,17 +996,25 @@ assert abs(model.loss(graphs) - np.mean(per_graph)) < 1e-6
         ),
         new_markdown_cell(
             """\
-## Infer on the second date, fully observed
+## Infer on the full second date, at native resolution
 
-`embed` stays single-graph: it is handed the complete 2019-08-01 network and returns one row per
-node. The only compatibility requirement is matching widths — 11 input features and `2P + 1 = 7`
-edge channels — which `Era5Graph` reproduces for any date at this stride."""
+Training ran on 50% samples at `STRIDE`, because the objective needs every training edge resident
+on every epoch. Inference does not: it is one forward pass per chunk, so it can cover the whole
+grid. The model is therefore applied to **all 719 x 1440 = 1,035,360 grid points** of 2019-08-01 at
+stride 1, a grid it has never seen.
+
+The radius has to shrink with the stride — 2.5 degrees at stride 1 would be ~917M edges (~40 GB) —
+and `0.005454` keeps the neighbourhood the fine grid can hold. `embed` stays single-graph and
+returns one row per node."""
         ),
         new_code_cell(
             """\
-infer_graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
-infer_features, infer_latitudes, infer_longitudes = infer_graph.load("2019-08-01")
-full = infer_graph.build(infer_features, infer_latitudes, infer_longitudes)
+INFER_STRIDE = 1
+INFER_RADIUS = 0.005454
+full_graph = Era5Graph(radius=INFER_RADIUS, stride=INFER_STRIDE, data_dir=DATA)
+full_features, full_latitudes, full_longitudes = full_graph.load("2019-08-01")
+full = full_graph.build(full_features, full_latitudes, full_longitudes)
+print(f"full grid: {full.num_nodes} nodes, {full.num_edges} edges")
 
 embedding = model.embed(full)
 print("embedding on 2019-08-01:", tuple(embedding.shape))
@@ -1029,7 +1039,7 @@ figure, axis = plt.subplots(
     1, 1, figsize=(12.0, 6.5), subplot_kw={"projection": ccrs.PlateCarree()}
 )
 axis.set_global()
-era5.draw_globe(axis, infer_latitudes, infer_longitudes, embedding.numpy())
+era5.draw_globe(axis, full_latitudes, full_longitudes, embedding.numpy())
 axis.coastlines(linewidth=0.5)
 axis.set_title(f"2019-08-01, never trained on: {full.num_nodes} nodes")
 plt.show()
@@ -1044,6 +1054,7 @@ plt.show()
 |`train` takes a list|One operator covers many graphs; an epoch is one step per graph|
 |Graphs need only matching widths|The samples are independent `Data` objects with their own edges|
 |`loss` on a list is a mean over graphs|Each graph counts once, whatever its node count|
+|Inference needs no training grid|A coarse, sub-sampled model embeds the full-resolution field|
 |`embed` takes one graph|Inference loop over the list if many embeddings are needed|"""
         ),
     ]
