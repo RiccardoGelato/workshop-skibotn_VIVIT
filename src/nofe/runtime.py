@@ -67,8 +67,8 @@ def validate_graph(data: Data) -> None:
     missing = tuple(name for name in required if getattr(data, name, None) is None)
     if missing:
         raise ValueError(
-            f"graph requires fields {missing}; build them with nofe.build_graph, "
-            "nofe.graphs.radius_graph or nofe.graphs.knn_graph"
+            f"graph requires fields {missing}; supply x, edge_index and edge_attr "
+            "(see the graph contract in the README)"
         )
 
     if data.x.dim() != 2:

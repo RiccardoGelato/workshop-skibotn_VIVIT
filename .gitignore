@@ -16,10 +16,11 @@ wheels/
 .ruff_cache/
 
 # Generated example plots
+examples/**/*.png
 examples/*.png
 
 # Notebook execution artefacts
-notebooks/*.pt
+examples/era5/notebooks/*.pt
 
 # ERA5 inputs for the notebooks: 21 MB per date, fetched by the user (see README)
-notebooks/data/*.nc
+#examples/era5/data/*.nc

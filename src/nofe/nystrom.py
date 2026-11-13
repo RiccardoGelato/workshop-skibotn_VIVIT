@@ -6,9 +6,6 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-from .config import DEFAULTS
-from .graphs import geometry_edge_attr, radius_graph
-
 
 def node_indices(data: Data, name: str) -> np.ndarray:
     """Node ids selected by a mask attribute, or every node when absent."""
@@ -61,17 +58,21 @@ class NystromSampler:
     @staticmethod
     def _subgraph_pairs(
         data: Data, active: np.ndarray, landmarks: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Landmark-sender, active-receiver pairs taken from ``data``'s own neighbourhood."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Landmark-sender, active-receiver edges of ``data``: ids plus the edge mask."""
         edge_index = getattr(data, "edge_index", None)
         if edge_index is None:
-            radius = float(DEFAULTS["radius"])
-            pairs, _ = radius_graph(data.pos, radius, sources=landmarks, targets=active)
-            return pairs[0].numpy(), pairs[1].numpy()
-        senders = edge_index[0].detach().cpu().numpy()
-        receivers = edge_index[1].detach().cpu().numpy()
-        keep = np.isin(senders, landmarks) & np.isin(receivers, active)
-        return senders[keep], receivers[keep]
+            raise ValueError("the Nyström path needs data.edge_index")
+        senders = edge_index[0]
+        receivers = edge_index[1]
+        # Marking tables beat ``np.isin`` here: the mask runs once per chunk over every edge of the
+        # graph, and ``isin`` rebuilds its lookup table from the second argument each time.
+        sender_flags = torch.zeros(data.num_nodes, dtype=torch.bool, device=senders.device)
+        sender_flags[torch.as_tensor(landmarks, device=senders.device)] = True
+        receiver_flags = torch.zeros(data.num_nodes, dtype=torch.bool, device=receivers.device)
+        receiver_flags[torch.as_tensor(active, device=receivers.device)] = True
+        kept = (sender_flags[senders] & receiver_flags[receivers]).cpu().numpy()
+        return senders.cpu().numpy()[kept], receivers.cpu().numpy()[kept], kept
 
     def active_graph(
         self,
@@ -82,40 +83,52 @@ class NystromSampler:
     ) -> Data:
         """Subgraph of ``queries`` first, then the remaining ``landmarks``.
 
-        Edges come from ``data`` when it carries them, filtered to landmark senders and active
-        receivers, so the subgraph inherits whatever neighbourhood ``build_graph`` chose. A
-        ``Data`` without edges falls back to ``radius_graph``.
+        Edges are ``data``'s own, filtered to landmark senders and active receivers, so the
+        subgraph inherits the neighbourhood of the graph it was handed. Their features are copied
+        from ``data.edge_attr`` too, because the edge kernel was trained on them.
         """
         queries = np.asarray(queries, dtype=np.int64).reshape(-1)
         landmarks = np.asarray(landmarks, dtype=np.int64).reshape(-1)
 
-        if not np.isin(queries, node_indices(data, "output_mask")).all():
+        every_output = node_indices(data, "output_mask")
+        every_input = node_indices(data, "input_mask")
+        if not np.isin(queries, every_output).all():
             raise ValueError("queries must be selected by output_mask")
-        if not np.isin(landmarks, node_indices(data, "input_mask")).all():
+        if not np.isin(landmarks, every_input).all():
             raise ValueError("landmarks must be selected by input_mask")
 
         active = np.concatenate((queries, landmarks[~np.isin(landmarks, queries)]))
-        lookup = {int(node): position for position, node in enumerate(active)}
-        senders, receivers = self._subgraph_pairs(data, active, landmarks)
-        mapped = np.asarray(
-            (
-                [lookup[int(node)] for node in senders],
-                [lookup[int(node)] for node in receivers],
-            ),
-            dtype=np.int64,
-        ).reshape(2, -1)
+        senders, receivers, kept = self._subgraph_pairs(data, active, landmarks)
+        # Senders and receivers are both in ``active``, so one lookup table over ``data.num_nodes``
+        # remaps them: indexing per edge in Python would cost a dict hit for every message.
+        lookup = np.full(data.num_nodes, -1, dtype=np.int64)
+        lookup[active] = np.arange(active.size, dtype=np.int64)
+        mapped = np.stack((lookup[senders], lookup[receivers]))
 
         index = torch.as_tensor(active, dtype=torch.long)
         pos = data.pos[index].to(device).float()
         # Features are copied unchanged: added rows already hold the substitute the dense path
         # sees, so zeroing them here would make the two paths disagree about the model input.
         x = data.x[index].to(device).float()
+        target = getattr(data, "y", None)
 
         edge_index = torch.as_tensor(mapped, dtype=torch.long, device=device)
-        edge_dist = torch.linalg.vector_norm(pos[edge_index[0]] - pos[edge_index[1]], dim=1)
-        edge_attr = geometry_edge_attr(pos, edge_index, edge_dist)
+        kept_index = torch.as_tensor(np.flatnonzero(kept), dtype=torch.long)
+        edge_dist = (
+            data.edge_dist.to(device)[kept_index]
+            if getattr(data, "edge_dist", None) is not None
+            else torch.linalg.vector_norm(pos[edge_index[0]] - pos[edge_index[1]], dim=1)
+        )
+        # ``kept_index`` indexes edges, not nodes: ``edge_attr`` has one row per edge. Edge order is
+        # unchanged, so the kept rows still line up with ``edge_index``.
+        edge_attr = data.edge_attr.to(device).float()[kept_index]
 
         active_graph = Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
+        # ``y`` travels with ``x``: a withheld query row has no features of its own, so its only
+        # target distribution is the truth the caller put in ``y``. Without this the Nyström
+        # objective falls back to ``x`` and silently skips every out-of-sample row.
+        if target is not None:
+            active_graph.y = target[index].to(device).float()
         active_graph.edge_dist = edge_dist
         active_graph.query_mask = torch.zeros(len(active), dtype=torch.bool, device=device)
         active_graph.query_mask[: len(queries)] = True

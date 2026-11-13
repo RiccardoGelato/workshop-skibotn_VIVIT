@@ -2,27 +2,29 @@
 
 Neural operator function embedding: graph-kernel dimensionality reduction.
 
-`nofe` takes a graph whose nodes carry feature vectors and learns a low-dimensional
-embedding by training a graph-kernel operator (GKO). The operator is trained so that the
-neighbourhood structure it predicts in embedding space reproduces the neighbourhood
-structure of the input features. For a query node $i$ the objective is
+`nofe` takes a graph whose nodes carry feature vectors, learns a low-dimensional embedding with a
+graph-kernel operator (GKO), and hands that embedding back. Training makes the *neighbourhood
+structure of the embedding* reproduce the *neighbourhood structure of the input features*. For a
+query node $i$, with $p_j$ the student-t affinity between feature vectors $x_i$ and $x_j$, and $q_j$
+the same kernel on the learned embedding $z$,
 
-$$\mathrm{KL}(p_i \,\|\, q_i) = \sum_{j \in \mathcal{N}(i)} p_j \log \frac{p_j}{q_j}$$
+$$\mathrm{KL}(p_i \,\|\, q_i) = \sum_{j \in \mathcal{N}(i)} p_j \log \frac{p_j}{q_j}, \qquad
+q_j \propto \frac{1}{1 + \lVert z_i - z_j \rVert^2}$$
 
-with the student-t kernel $q_j \propto 1 / (1 + \lVert y_i - y_j \rVert^2)$ over the learned
-embedding $y$, and $p$ the same kernel evaluated on the input features $x$. Distances are
-normalised per query node, so neighbourhoods of any degree are comparable, and the loss is
-the mean over query nodes rather than a sum over edges.
+($z$ is the embedding, returned by `embed`; `data.y` is a different thing — the ground-truth feature
+row of a node whose `x` is only a substitute, described under
+[The row contract for out-of-sample rows](#the-row-contract-for-out-of-sample-rows).)
 
-Two axes are independent:
+Distances are normalised per query node, so neighbourhoods of any degree are comparable, and the
+loss is the mean over query nodes rather than a sum over edges.
 
-| Axis | Values | Fixed by |
-|---|---|---|
-| neighbourhood | `"radius"` (default) or `"knn"` | `build_graph(...)`; the graph you pass in |
-| operator | dense (default) or Nyström landmarks | `config["nystrom"]`, once at construction |
+Two things follow from that objective, and they explain most of the package's surface:
 
-`nofe.build_graph` turns arrays into the `Data` the operator consumes; `nofe.graphs.radius_graph`
-and `nofe.graphs.knn_graph` are the edge builders underneath it.
+- **The graph decides what "neighbour" means.** `nofe` never builds neighbourhoods and never reads
+  `pos` to derive edges. A radius, a k-nearest set, a mesh, a physical model — whatever `edge_index`
+  says is the neighbourhood is the one the embedding is trained to preserve.
+- **Only the operator is the package's business.** Everything else — which rows exist, which rows
+  send, which rows are scored — is configuration the caller expresses through the graph's fields.
 
 ## Install
 
@@ -37,202 +39,284 @@ uv add nofe        # or: pip install nofe
 | macOS arm64 | `uv sync` (Metal/MPS is enabled in the default macOS wheel) |
 | Windows AMD64 | `UV_TORCH_BACKEND=cpu uv sync` |
 
-`torch` is pinned as `torch>=2.6,<3`; the CUDA variant is selected by `UV_TORCH_BACKEND` at
-install time and the shipped `uv.lock` is backend-independent. Requires Python ≥ 3.11.
-`pip install nofe` also pulls `faiss-cpu`, which backs the neighbour search; when faiss is
-missing or unusable the search silently falls back to `scipy.spatial.cKDTree` and prints one
-`RuntimeWarning`.
+`torch` is pinned as `torch>=2.6,<3`; the CUDA variant is selected by `UV_TORCH_BACKEND` at install
+time and the shipped `uv.lock` is backend-independent. Requires Python ≥ 3.11. Runtime dependencies
+are only `torch`, `torch-geometric` and `numpy`.
 
-### VS Code
+## Providing data
 
-`.vscode/settings.json` points VS Code at `.venv`, so the Python extension, Pylance, the
-integrated terminal and the test runner all use this project's interpreter with no picker step.
-It also enables pytest discovery over `tests/` and adds `src` to Pylance's search path.
+`nofe` consumes a single `torch_geometric.data.Data` per call. There is no dataset class, no
+transform pipeline and no train/test file format: assemble the graph yourself, from whatever your
+data source is, and hand it over.
 
-This is a per-workspace override: the machine's user-level `python.defaultInterpreterPath` points
-at a conda environment, and the workspace setting wins only for this folder. If the status bar
-still shows another interpreter, run **Python: Select Interpreter** and choose
-`.venv/bin/python` once — VS Code then records it in its own workspace state.
+### Required fields
 
-For the notebooks, install the extra and register a kernel once:
+| Field | Shape / dtype | Meaning |
+|---|---|---|
+| `x` | `[N, F]` float | the features whose neighbourhoods define the target affinities. Also the loss target when there is no `y`. |
+| `edge_index` | `[2, E]` **int64** (`torch.long`) | `[sender, receiver]`; messages flow `row 0 -> row 1`. Self loops are allowed but unnecessary. |
+| `edge_attr` | `[E, D]` float | one feature row per edge; this is what the kernel MLP sees, so it decides the operator's geometry. |
 
-```bash
-uv sync --extra notebooks
-.venv/bin/python -m ipykernel install --user --name nofe-pkg --display-name "NOFE (repo .venv)"
-```
+`N` is `data.num_nodes`. `F` and `D` are inferred from the tensors — they fix the model's input and
+edge widths at first build and cannot change afterwards. Reusing a trained model on a graph with a
+different `F` or `D` fails inside the first linear layer (`RuntimeError: addmm: mat1 and mat2 shapes
+cannot be multiplied`); graphs that must share a model have to agree on both widths.
 
-Then open any notebook and pick **NOFE (repo .venv)** as the kernel. The name is deliberately
-specific rather than `nofe`: a `nofe` kernelspec may already exist and point at a different
-checkout, in which case selecting it silently runs the wrong environment. Check with
-`jupyter kernelspec list` if a notebook imports an unexpected `nofe`.
+### Optional fields
 
-The notebooks find their data from the repository layout rather than the process cwd, because VS
-Code always starts kernels in the workspace folder (`jupyter.notebookFileRoot` has been ignored
-since extension 2024.4). Running them from VS Code, from `notebooks/`, or through `_execute.py` all
-resolve `notebooks/data` the same way.
+| Field | Shape / dtype | Meaning |
+|---|---|---|
+| `pos` | `[N, P]` float | node coordinates. Never used to derive edges. **Required by the Nyström path**, which slices it when building subgraphs, so a Nyström graph without it fails with `TypeError: 'NoneType' object is not subscriptable`; the dense path never reads it. |
+| `y` | `[N, F]` float | ground-truth features for rows whose `x` is only a substitute. Reaches the objective only — never `x`, never the edges. |
+| `input_mask` | `[N]` bool | provenance: `True` = an observed row. On the Nyström path this is the landmark pool. |
+| `output_mask` | `[N]` bool | the rows to embed and score. Default: all rows. `input_mask` must be a subset of it. |
+| `edge_dist` | `[E]` float | carried through untouched if you set it; `nofe` never needs it. |
 
-## Graph contract
+Any other attribute you attach survives cloning and moves with the graph, so metadata (ids,
+timestamps, station names) can ride along.
 
-Every method consumes `torch_geometric.data.Data` with these fields:
+### What validation enforces
 
-|Field|Required|Shape|Meaning|
-|---|---|---|---|
-|`x`|always|`[N, F]` float|node features the model consumes; also the loss target when `y` is absent|
-|`edge_index`|always|`[2, E]` int64|`[neighbor, query]`; messages flow `0 -> 1`|
-|`edge_attr`|always|`[E, D]` float|edge features driving the kernel|
-|`pos`|optional|`[N, P]` float|coordinates; 2-D when present|
-|`y`|optional|`[N, F]` float|ground truth for rows whose `x` is only a substitute|
-|`input_mask`|optional|`[N]` bool|provenance: `True` = observed row (sends messages)|
-|`output_mask`|optional|`[N]` bool|rows to embed and score (default: all)|
+`validate_graph` runs on every `train`/`embed`/`loss`/`build` call and raises `ValueError` naming the
+offending field:
+- `x` is 2-D; `edge_index` is `[2, E]`, `torch.long`, and every id is in `[0, N)`.
+- `edge_attr` has exactly `E` rows.
+- `pos`, `input_mask`, `output_mask` are 1-D with `N` entries.
+- `input_mask ⊆ output_mask` when both are present.
+- `y`, when present, has exactly the shape of `x`.
 
-Node count always comes from `data.num_nodes`. The convolution aggregates with `mean`, so
-self loops are not required; the builders never emit them. `validate_graph` raises a
-`ValueError` naming the offending field.
+Float fields are cast to `float32` on the way to the device, so `float64` inputs are accepted; the
+embedding comes back on CPU.
 
-## Building a graph
+### Semantics worth knowing before you assemble edges
 
-```python
-from nofe import build_graph
+- **Aggregation is `mean` with a root weight.** Each layer computes
+  `h_i' = W_root h_i + mean_{j -> i} MLP(edge_attr_ji) h_j`, then ReLU. Two consequences:
+  self loops are unnecessary (`nofe` supplies the self term), and a node's own features reach its
+  embedding even when it has no incoming edges.
+- **A directed edge `i -> j` feeds `x_i` into `y_j` and nothing else.** There is no reverse edge
+  unless you add one. A radius or k-NN graph is usually made symmetric by the builder; a graph with
+  observed rows as the only senders is deliberately not.
+- **The loss only scores receivers.** KL is defined over each query node's incoming neighbourhood, so
+  a row with zero in-degree contributes nothing (its `x` still drives its own embedding through the
+  root weight). If a scored row's neighbourhood is empty, that row is silently absent from the
+  objective — check `torch.bincount(edge_index[1], minlength=N) == 0` for the rows you expect to be
+  scored.
 
-data = build_graph(positions, features, neighbor="knn", k=10)
-```
+### Building a neighbourhood
 
-|Argument|Meaning|
-|---|---|
-|`positions`|`[N, P]` observed coordinates|
-|`features`|`[N, F]` observed features; `None` only with `feature_dim=` and added locations|
-|`query_positions`|`[Q, P]` added locations, features unknown|
-|`query_features`|`[Q, F]` ground truth for the added locations; goes to `y`, never to `x`|
-|`feature_dim`|required when `features is None`|
-|`neighbor`|`"radius"` (default) or `"knn"`|
-|`radius`, `k`|neighbourhood size for the chosen `neighbor`|
-|`fill`|`"interpolate"` (default), `"zeros"` or `"mean"` — how added rows are initialized|
+The intended neighbourhood is a **radius** graph. `nofe` trains a graph-kernel operator, and a
+radius graph is what makes that operator a genuine neural-operator construction: the edge set is a
+discretisation of a continuum kernel rather than a per-point lookup table. A kernel restricted to
+each row's `k` nearest neighbours is not a fixed operator — it changes with how densely that region
+happens to be sampled, so two rows in different density regimes get kernels with different support,
+and moving one point can flip an edge on the far side of the graph. The radius form keeps the kernel
+fixed: the same physical distance means the same neighbourhood everywhere, and refining the sampling
+converges to the same operator. That is the property the Nyström path relies on to sub-sample
+landmarks and stay faithful to the full-graph operator.
 
-Merging unions **locations, not features**. The node set becomes `positions ∪ query_positions`,
-but the added locations have no known features: they are initialized by `fill` from the observed
-rows and stay `input_mask=False`, so they receive messages and never send — the same graph at
-training and at inference. `query_features`, when supplied, is those locations' **ground truth**
-and lands in `y` for the loss only.
-
-||Call|`x` on added rows|`y`|Loss covers|
-|---|---|---|---|---|
-|in-sample|`build_graph(p, f)`|— no added rows|absent|all rows|
-|merged + truth (training)|`+ query_positions=q, query_features=fq`|`fill` substitute|`fq`|inputs + added|
-|merged, no truth (inference)|`+ query_positions=q`|`fill` substitute|absent|not scorable, `embed` only|
-
-Which locations you withhold is entirely your choice: pass them in `query_positions` and put
-their truth in `query_features`. There is no holdout fraction; duplicates are dropped by exact
-coordinate match with one `UserWarning`. `fill="interpolate"` takes the inverse-distance-weighted
-mean of the `k` nearest observed rows, because zeros make an added row look like an observation at
-the feature origin.
+In practice this means `edge_attr` should carry a **continuous function of relative position** —
+typically the receiver's coordinates plus a unit direction, or a distance — so the kernel has
+something smooth to interpolate across. If `edge_attr` only says "this is the 3rd neighbour", the
+operator degenerates into an attention-like mechanism over a learned lookup, and the continuum
+argument no longer applies.
 
 ```python
+import faiss
+import numpy as np
 import torch
-from nofe import NOFE, build_graph
+from torch_geometric.data import Data
 
-positions = torch.rand(900, 2) * 2 * torch.pi
-features = torch.rand(900, 3)
 
-# 1. in-sample: one node per observed row
-data = build_graph(positions, features, neighbor="knn", k=10)
+def radius_graph(pos, x, radius):
+    """Each row receives from every row within ``radius`` (self excluded)."""
+    points = np.ascontiguousarray(pos, dtype=np.float32)
+    index = faiss.IndexFlatL2(pos.shape[1])
+    index.add(points)
+    # IndexFlatL2 reports squared distances, so the search radius is squared.
+    limits, _, found = index.range_search(points, float(radius) ** 2)
+    receiver = np.repeat(np.arange(len(points), dtype=np.int64), np.diff(limits.astype(np.int64)))
+    keep = found != receiver
+    edge_index = torch.from_numpy(np.stack((found[keep], receiver[keep])).astype(np.int64))
+    delta = pos[edge_index[0]] - pos[edge_index[1]]
+    direction = delta / (delta.norm(dim=1, keepdim=True) + 1e-8)
+    edge_attr = torch.cat((pos[edge_index[1]], direction), dim=1)
+    return Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
+```
+
+Choosing `radius` is a modelling decision, not a tuning detail: it sets the operator's support. Too
+small and rows genuinely have no neighbours; a uniform-random 200-point square has 172 of 200 rows
+isolated at radius 2 and none at radius 10. A row with no incoming edge is embedded from its own
+features alone through the root weight, so it is not broken — but it carries no neighbourhood
+information, and on the merged workflow a queried row that no observed row reaches is predicted from
+its `fill` substitute only. Check the in-degree distribution before trusting those rows.
+
+### A k-NN builder, for easier implementation
+
+A `k`-nearest-neighbour graph is **not** the intended architecture, but it is a legitimate shortcut
+and the right choice in some cases:
+
+- the sampling density is wildly uneven, so no single radius serves the whole domain;
+- a plain index search is simpler to wire up than a radius sweep you then have to calibrate;
+- you want a guaranteed in-degree of exactly `k` with no isolated rows, which is what makes a demo
+  or a first prototype predictable.
+
+Its costs are the ones listed above: the support varies with local density, the edge set is
+discontinuous in the coordinates, and on the merged workflow every queried row necessarily attaches
+to `k` senders however far away the nearest observed row is — which hides the "nothing observed
+nearby" case a radius graph reports honestly.
+
+```python
+def knn_graph(pos, x, k=10):
+    """Each row receives from its k nearest neighbours (self excluded)."""
+    points = np.ascontiguousarray(pos, dtype=np.float32)
+    index = faiss.IndexFlatL2(pos.shape[1])
+    index.add(points)
+    pairs = index.search(points, k + 1)[1][:, 1:]
+    edge_index = torch.from_numpy(
+        np.stack([pairs.reshape(-1), np.repeat(np.arange(pos.shape[0]), k)])
+    )
+    delta = pos[edge_index[0]] - pos[edge_index[1]]
+    direction = delta / (delta.norm(dim=1, keepdim=True) + 1e-8)
+    edge_attr = torch.cat((pos[edge_index[1]], direction), dim=1)
+    return Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
+```
+
+Both builders are deliberately minimal; `examples/graph_utils.py` has the general versions
+(`radius_edges`, `knn_edges`), including restricting senders to observed rows for the merged
+workflow.
+
+Either way `edge_attr` is entirely your choice — it is the kernel's input, not a distance. Position
+of the receiver plus a unit direction is the convention the reference implementations use; a bare
+distance, a physical quantity, or a one-hot edge type works just as well.
+
+## Graph structure
+
+A graph handed to `nofe` is usually in one of three shapes. The differences are which rows exist and
+who is allowed to send, and they map directly onto which methods are legal.
+
+| Shape | Rows | `edge_index` senders | Masks | `y` |
+|---|---|---|---|---|
+| **in-sample** | one per observed row | every row (builder's choice) | none | none |
+| **merged** (out-of-sample with truth) | observed rows first, then queried rows | observed rows only | `input_mask`, `output_mask` | required for the queried rows |
+| **blind** (out-of-sample, no truth) | observed rows first, then queried rows | observed rows only | `input_mask`, `output_mask` | absent |
+
+The *merged* and *blind* shapes are the same graph; they differ only in whether the queried rows
+carry `y`. That is deliberate — the edges never depend on the truth, so one graph serves training
+and inference, and dropping `y` cannot change an embedding.
+
+The `senders` column is the builder's job on every path. This is the single most important thing to
+get right: **the dense operator never consults `input_mask`.** It aggregates over exactly the edges
+you supply, so a withheld row that appears as a sender still sends. `input_mask` is provenance — it
+marks which rows are observed — and only the Nyström path uses it structurally, to pick landmarks.
+If withheld rows must not send, do not create edges out of them.
+
+### The row contract for out-of-sample rows
+
+| Row kind | `x` | `y` | `input_mask` | `output_mask` | sends | receives |
+|---|---|---|---|---|---|---|
+| observed | its features | its features (or omitted) | `True` | `True` | yes | yes |
+| queried | a **substitute** | its truth when known | `False` | `True` | no | yes |
+
+A queried row has no features of its own, so `x` must hold something. `nofe` never invents that
+substitute: it consumes whatever you put there, and only validates that a graph whose scored rows
+lie outside `input_mask` also carries `y` (otherwise those rows would be scored against a fabricated
+target). The usual choices are zeros, the observed mean, or an inverse-distance-weighted mean of the
+nearest observed rows — the last is what the reference builders use, because zeros make a withheld
+row look like a genuine observation at the feature origin.
+
+Because queried rows never send, a queried location with no observed row inside its neighbourhood
+gets **no incoming edges at all**. Its embedding is then only what its substitute and the root weight
+produce, so check in-degree before trusting such rows. The k-NN builder always attaches `k` senders
+however far away the nearest observed row is; a fixed radius does not.
+
+## Workflows
+
+Four workflows, differing in whether rows are withheld and which operator runs. The operator is
+fixed at construction by `config["nystrom"]` and is never a per-call switch — mixing modes between
+training and inference silently changes the network's input statistics.
+
+### 1. In-sample (the exact path)
+
+Every row is observed. Build any neighbourhood, train, embed.
+
+```python
+from nofe import NOFE
+
 model = NOFE(dim=2, config={"epochs": 150})
-history = model.train(data)
-embedding = model.embed(data)  # [900, 2]
+history = model.train(data)  # mean KL over output_mask rows
+embedding = model.embed(data)  # [N, dim], CPU tensor
+score = model.loss(data)  # same objective, no gradient
+```
 
-# 2. out-of-sample with truth: withheld rows get a substitute in x and their truth in y
-merged = build_graph(
-    positions[:800],
-    features[:800],
-    query_positions=positions[800:],
-    query_features=features[800:],
-    neighbor="knn",
-    k=10,
-)
+One forward pass covers the whole graph. The train/validation split selects *which scored rows*
+enter the objective (`val_fraction`, drawn from `config["seed"]`), never which neighbours are
+visible, so gradients flow through the entire edge set. This is the reference path: it is exact, and
+it is what to reach for whenever the graph fits in memory.
+
+### 2. Merged: out-of-sample with truth
+
+Observed rows and queried rows in one graph, with `y` on the queried rows. Training scores **all**
+scored rows, out-of-sample included, because each of them has a target distribution to match.
+
+```python
+merged = build_merged(...)  # input_mask/output_mask set, y set
 model = NOFE(dim=2, config={"epochs": 150})
-history = model.train(merged)  # scores all 900 rows
+model.train(merged)  # scores observed + queried rows
 score = model.loss(merged)
-
-# 3. true out-of-sample: same graph, no truth, embed only
-blind = build_graph(
-    positions[:800],
-    features[:800],
-    query_positions=positions[800:],
-    neighbor="knn",
-    k=10,
-)
-model.embed(blind)  # [900, 2]; train()/loss() refuse it
+prediction = model.embed(merged)  # one row per output_mask row
 ```
 
-Two runnable scripts:
+This is how the operator learns to place locations it has never seen features for: the withheld rows
+contribute to the objective through `y` while receiving messages from observed rows only.
 
-|Script|Shows|
+### 3. Blind: true out-of-sample, embed only
+
+Identical graph, no `y`. `embed` works unchanged; `train` and `loss` refuse it with an explicit
+error, because the scored rows hold substitutes rather than truth.
+
+```python
+blind = build_merged(...)  # same rows and edges, no y
+model.embed(blind)  # fine
+model.train(blind)  # ValueError: ... no ground-truth features ...
+```
+
+A model trained on the merged graph is what you apply here: same weights, same edges, so the only
+change between training and inference is the absence of the target.
+
+### 4. Nyström: large graphs
+
+`config={"nystrom": fraction}` swaps the dense operator for a landmark approximation. Landmarks are
+drawn from `input_mask`, `round(fraction * |input_mask|)` of them, and are the **only senders**;
+every `output_mask` row is a receiver. Each step builds an active subgraph holding the queries first
+and then the landmarks not already among them, keeping your own edges whenever the sender is a
+landmark and the receiver is in that set, with each `edge_attr` row copied unchanged. Landmarks
+therefore receive as well as send when your graph has landmark-to-landmark edges — only sending is
+restricted. Peak memory is `O(queries × mean_degree)`.
+
+On the Nyström path, `pos` is required. Supervision needs a target distribution per query row, taken
+from `y` when present and from `x` otherwise, which is why `y` is carried into the subgraph. The
+same truth rule as the dense path applies: a graph whose scored rows lie outside `input_mask` and
+which carries no `y` is refused outright (`ValueError: cannot score a graph with no ground-truth
+features`) rather than silently scored against substitutes. When `y` is present, every
+`output_mask` row is scored, out-of-sample included; without masks, the scored rows are the ones
+owning their features.
+
+`chunk_size` walks the queries in fixed-size blocks and changes peak memory only, never the result.
+It matters most here: a small chunk rebuilds the active subgraph many times per epoch.
+
+### Choosing between them
+
+| Situation | Workflow |
 |---|---|
-|`examples/swiss_roll.py`|synthetic features on a 2-D domain: the dense path, a merged out-of-sample graph on the Nyström path, and a checkpoint round trip|
-|`examples/era5.py`|a real single-timestep ERA5 field over the whole globe: 11 physical variables as the feature space, every grid point as the domain, `dim=3`, and an RGB map of the embedding|
+| every location observed, graph fits in memory | in-sample, dense |
+| every location observed, graph too large | in-sample, Nyström |
+| some locations have no features but their truth is known | merged, dense or Nyström |
+| deploying on locations with no features and no truth | blind (embed with a merged-trained model) |
+| you need bit-exact, reproducible geometry | dense |
 
-The ERA5 example needs the optional dependencies and a netCDF file:
-
-```bash
-uv sync --extra examples
-uv run python examples/era5.py                      # default: /Volumes/T7-storage/ERA5/data/2018-01-01.nc
-NOFE_ERA5_DATA=/path/to/era5 uv run python examples/era5.py --date 2018-06-01
-```
-
-It prints graph size, loss history and mean KL, then writes `examples/era5_embedding.png`: the full globe in
-a cartopy `PlateCarree` projection with coastlines and borders, where R/G/B are the three embedding
-dimensions. The map shows the embedding, not the input features — a PCA of the 11 variables is not plotted.
-Each channel is centred on its mean and divided by twice its 5th/95th-percentile deviation (the reference
-`rgb_scale`), because a single extreme point would otherwise compress the whole field into a grey wash.
-
-The plot is `pcolormesh`, one quad per grid point carrying its own RGB triple (`era5.draw_globe`). Unlike an
-`imshow` raster it needs no repeated seam column: the quad edges run cell-to-cell, so the antimeridian closes
-between the last and first column and non-finite cells stay transparent (alpha 0) instead of being painted.
-The RGBA array is passed as `C`, not as `color=`, because `color` sets a single facecolour that matplotlib
-then overrides with the scalar array's colormap.
-
-`NOFE_ERA5_DATA` selects the directory, `NOFE_ERA5_DATE` the file stem, `--data`/`--date`/`--out` override both.
-
-`STRIDE = 2` keeps every ERA5 grid point (258,480 nodes, 2,584,800 edges); raise it to shrink the graph.
-`CONFIG` pins `width=8, ker_width=32`, the reference ERA5 model configs. That matters on MPS: `NNConv`
-materialises an `[num_edges, width]` message tensor, so at 2.58M edges the nofe defaults (`width=32`) need
-~9.9 GiB and abort with `MPS backend out of memory` (observed: 20.11 GiB allocated), while `width=8` needs
-0.62 GiB and the whole run peaks at 0.94 GiB. `edge_batch_size` does not help — `EdgeConv.message` concatenates
-every chunk before returning, so the full stack is allocated regardless.
-
-## Notebooks
-
-`notebooks/` holds three executed walkthroughs on real ERA5 data. They need two dates,
-2018-01-01 and 2018-01-02, in `notebooks/data/`; that directory is **not** in Git (each file is
-21 MB), so fetch them once before running the notebooks. Nothing in `nofe` itself depends on them.
-
-```bash
-mkdir -p notebooks/data
-cp /Volumes/T7-storage/ERA5/data/2018-01-0{1,2}.nc notebooks/data/   # any ERA5 source works
-```
-
-They are the fastest way to see which workflow matches a problem:
-
-|Notebook|Shows|
-|---|---|
-|`1-in-sample.ipynb`|every location observed: `build_graph` → `train` → `embed` → `loss`, a PCA baseline, the per-point RGB globe, and a checkpoint round trip|
-|`2-held-out-training.ipynb`|a random 20% of locations withheld: the `observed` / `merged` / `blind` graphs, `fill` substitution, training against `y`, and two predictions of the same coarse graph — all locations vs observed rows only|
-|`3-transfer-between-dates.ipynb`|train on 2018-01-01, embed 2018-01-02 fully observed and half withheld; `output_mask` selects the returned rows|
-
-```bash
-uv sync --extra notebooks
-cd notebooks && uv run python _execute.py      # run and store outputs in place
-uv run python _build.py                        # regenerate the .ipynb sources from _build.py
-```
-
-`_build.py` is the source of truth for the cell content; edit it and rebuild rather than editing the
-JSON. `_execute.py` doubles as the notebooks' test: any cell that raises fails the run.
-
-Each notebook scores against `pca_baseline`, the best *linear* projection to three dimensions. On
-this data the 11 variables are nearly isotropic (the top three components carry 54% of the
-variance), so the trained operator reaches KL ≈ 0.014 where PCA-3 reaches ≈ 0.055; exact 10-NN set
-overlap is a much weaker proxy and is reported alongside for honesty. On MPS, repeated forward
-passes differ by ~4e-6 on embeddings of magnitude ~20, so the round-trip check uses a relative
-tolerance; `device="cpu"` is bit-exact.
+Dense and Nyström agree on the model input — withheld rows already hold your substitute in both — and
+differ only in which rows send messages. Expect the Nyström embedding to be close, not identical.
 
 ## API
 
@@ -243,123 +327,88 @@ NOFE(dim=2, *, config=None, **overrides)
 `config` is a mapping and the keyword arguments are flat overrides; merge order is
 `DEFAULTS` < `config` < keyword overrides. Unknown keys fail at construction.
 
-|Member|Returns / raises|Notes|
+| Member | Returns / raises | Notes |
 |---|---|---|
-|`.config`|`dict`|defaults + mapping + overrides + `dim`|
-|`.model`|`KernelNN`|`RuntimeError` before build/train/embed/loss|
-|`.device`|`torch.device`|resolved from `config["device"]` at construction|
-|`.history`|`list[dict]`|`epoch`, `train_loss`, `val_loss`, `best_val_loss`|
-|`.best_val_loss`|`float \| None`|best validation loss seen; `None` before training|
-|`.build(data)`|`KernelNN`|infers widths from `data`; later calls reuse the weights|
-|`.train(data)`|`list[dict]`|trains in place and returns the history|
-|`.embed(data)`|CPU `torch.Tensor`|`[num_output_nodes, dim]`, rows in `output_mask` order|
-|`.loss(data)`|`float`|mean KL over the scored rows of the trained operator|
-|`.save(path)`|`Path`|writes a `nofe-checkpoint-2` payload|
-|`NOFE.load(path, device=None)`|`NOFE`|`weights_only=True` load, model in `eval()` mode; a `nofe-checkpoint-1` file (which had a `method` argument) is rejected with a retrain hint|
+| `.config` | `dict` | defaults + mapping + overrides + `dim` |
+| `.model` | `KernelNN` | `RuntimeError` before build/train/embed/loss |
+| `.device` | `torch.device` | resolved from `config["device"]` at construction |
+| `.history` | `list[dict]` | `epoch`, `train_loss`, `val_loss`, `best_val_loss` |
+| `.best_val_loss` | `float \| None` | best validation loss seen; `None` before training |
+| `.build(data)` | `KernelNN` | infers widths from `data`; later calls reuse the weights |
+| `.train(data)` | `list[dict]` | trains in place and returns the history |
+| `.embed(data)` | CPU `torch.Tensor` | `[num_output_nodes, dim]`, rows in `output_mask` order |
+| `.loss(data)` | `float` | mean KL over the scored rows of the trained operator |
+| `.save(path)` | `Path` | writes a `nofe-checkpoint-2` payload |
+| `NOFE.load(path, device=None)` | `NOFE` | `weights_only=True` load, model in `eval()` mode; a `nofe-checkpoint-1` file is rejected with a retrain hint |
+
+`embed` and `loss` both take their target from `y` when present and from `x` otherwise. `embed`
+always returns one row per `output_mask` node, in that order, for both operators — so the same call
+signature works for all four workflows, and a graph carrying masks needs no post-hoc filtering.
 
 ### Config keys
 
-|Key|Default|Meaning|
+| Key | Default | Meaning |
 |---|---|---|
-|`width`|`32`|model width|
-|`ker_width`|`64`|kernel MLP width|
-|`depth`|`3`|number of convolution layers|
-|`edge_batch_size`|`32768`|edge chunking; `None` disables it|
-|`neighbor`|`"radius"`|`"radius"` or `"knn"`; passed to `build_graph` when you call it|
-|`radius`|`1.0`|radius for `neighbor="radius"`|
-|`k`|`10`|neighbours for `neighbor="knn"`|
-|`epochs`|`200`|training epochs|
-|`lr`|`1e-2`|AdamW learning rate|
-|`weight_decay`|`5e-4`|AdamW weight decay|
-|`grad_clip`|`1.0`|gradient-norm clip; `None` disables it|
-|`patience`|`20`|early-stopping patience|
-|`min_delta`|`1e-6`|minimum validation improvement|
-|`val_fraction`|`0.1`|share of the scored rows held out for validation|
-|`early_stopping`|`True`|stop when validation stalls|
-|`seed`|`42`|seed for python, numpy, torch and the landmark draws|
-|`device`|`"auto"`|`"auto"`, `"cpu"`, `"cuda"` or `"mps"`|
-|`verbose`|`False`|print loss progress|
-|`log_every`|`1000`|print every N epochs (the final epoch always prints)|
-|`nystrom`|`None`|`None` = dense operator; a fraction in `(0, 1]` enables the Nyström approximation with that landmark share|
-|`chunk_size`|`8192`|query chunk size for the Nyström path|
+| `width` | `32` | model width |
+| `ker_width` | `64` | kernel MLP width |
+| `depth` | `3` | number of convolution layers |
+| `edge_batch_size` | `65536` | edge chunking during message passing; `None` disables it |
+| `epochs` | `200` | training epochs |
+| `lr` | `1e-2` | AdamW learning rate |
+| `weight_decay` | `5e-4` | AdamW weight decay |
+| `grad_clip` | `1.0` | gradient-norm clip; `None` disables it |
+| `patience` | `20` | early-stopping patience |
+| `min_delta` | `1e-6` | minimum validation improvement |
+| `val_fraction` | `0.1` | share of the scored rows held out for validation |
+| `early_stopping` | `True` | stop when validation stalls |
+| `seed` | `42` | seed for python, numpy, torch and the landmark draws |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"` or `"mps"` |
+| `verbose` | `False` | print loss progress |
+| `log_every` | `1000` | print every N epochs (the final epoch always prints) |
+| `nystrom` | `None` | `None` = dense operator; a fraction in `(0, 1]` enables the Nyström approximation |
+| `chunk_size` | `8192` | row chunk size for report and query walking; memory, not result |
 
-Early stopping is on by default: training breaks once validation stops
-improving for `patience` epochs, and the best weights are restored. With
-`early_stopping=False` every epoch runs and the best epoch is **still** restored, so the
-final model is deterministic given the seed.
-
-`neighbor`/`radius`/`k` are echoed in `config` so a resolved config can be passed straight to
-`build_graph(**{key: config[key]})`; `nofe` itself never builds edges for you.
-
-## Neighbourhoods and Nyström
-
-**Neighbourhood.** `build_graph(..., neighbor=...)` decides the edges, once, before the model
-sees anything: `radius` (default) connects every row within `radius`, `knn` connects each row to
-its `k` nearest senders, and either way the senders are the observed rows. The operator is
-neighbourhood-agnostic — it consumes `edge_index`/`edge_attr` — so the two choices are
-interchangeable and produce identical `edge_index` bytes whichever search backend (faiss or the
-scipy fallback) is installed.
-
-**Dense operator** (`nystrom=None`, the default) is the exact path. One forward pass covers the
-whole graph; the train/validation split selects which scored rows enter the objective
-(`val_fraction` of `output_mask`, drawn from `config["seed"]`), not which neighbours are visible,
-so gradients flow through the entire edge set.
-
-**Nyström operator** (`nystrom=fraction`) approximates the operator with landmarks:
-
-- Landmarks are the **senders** of messages, drawn from `input_mask`, and there are
-  `round(fraction × |input_mask|)` of them (at least one). Queries are the receivers, taken from
-  `output_mask ∩ input_mask` for supervision and from `output_mask` for embedding (a row without
-  features has no target distribution).
-- The active subgraph keeps, from the graph's own edges, every edge whose sender is a landmark
-  and whose receiver is active, so the approximation inherits whatever neighbourhood
-  `build_graph` chose and peak memory is `O(queries × mean_degree)` per step.
-- Subgraph features are copied unchanged. Withheld rows already hold the `fill` substitute the
-  dense path sees; nothing zeroes them at forward time, so the two paths agree on the model input.
-- Queries are walked in ascending node order in chunks of `chunk_size`; chunk size changes peak
-  memory, not the result.
-- The mode is fixed at construction. There is deliberately no per-call override: `EdgeConv`
-  aggregates with `mean` and `geometry_edge_attr` rescales the per-receiver `relative` distance
-  column, so switching modes between training and inference changes the network's input
-  statistics without any error surfacing.
-
-**`embed` and `loss`.** `embed` always returns one row per `output_mask` node, in that order, for
-both operators. `loss` scores the `output_mask` rows. Both take the target from `y` when present
-and from `x` otherwise; a graph whose scored rows include added locations but carry no `y` is
-refused by `train` and `loss` (`embed` still works) because those rows hold a substitute, not
-truth.
+All keys are validated at construction. Early stopping is on by default; with
+`early_stopping=False` every epoch runs and the best epoch is **still** restored, so the final model
+is deterministic given the seed. `edge_batch_size` and `chunk_size` bound peak memory without
+changing the output.
 
 ## Platform notes
 
-- Intel macOS is unsupported: no `torch` wheel ships for `macosx_*_x86_64` at any version
-  ≥ 2.6.
-- macOS arm64 requires macOS ≥ 14, because torch 2.15 publishes
-  `macosx_14_0_arm64` wheels.
+- Intel macOS is unsupported: no `torch` wheel ships for `macosx_*_x86_64` at any version ≥ 2.6.
+- macOS arm64 requires macOS ≥ 14, because torch 2.15 publishes `macosx_14_0_arm64` wheels.
 - CPU/CUDA choice happens at install time (`UV_TORCH_BACKEND`), device choice at runtime
   (`config={"device": ...}`). `"auto"` prefers CUDA, then MPS, then CPU.
-- The caller's `Data` is cloned before it moves to the accelerator, so `data.x.numpy()`
-  keeps working on the CPU copy.
-- Checkpoints from the research repository use `NNConv_old` parameter names
-  (`conv1.root`); map `root.T -> lin.weight` by hand — no compatibility loader ships.
-- `faiss-cpu` is pinned to `>=1.15,<1.16`: 1.16.0 publishes only `macosx_15_0_*` wheels and
-  breaks macOS 14, while 1.15.1 ships wheels for every platform in `required-environments`. Its
-  macOS wheel bundles its own `libomp.dylib`, so a process that has already loaded torch's copy
-  would abort on the first parallel search (`OMP: Error #15`); `nofe` detects the duplicate
-  runtime and uses the scipy fallback with one `RuntimeWarning` instead of crashing.
-- The `examples` extra pins `netCDF4<1.7.5`: 1.7.5+ publishes only macOS 15 wheels, so macOS 14 cannot
-  install it. It also pulls `cartopy`, whose `coastlines()`/`BORDERS` download Natural Earth shapefiles on
-  first use and cache them in `~/.local/share/cartopy`. Everything else in `nofe` remains torch-only;
-  `pip install nofe` pulls neither matplotlib nor cartopy.
+- The caller's `Data` is cloned before it moves to the accelerator, so `data.x.numpy()` keeps
+  working on the CPU copy.
+- Checkpoints from the research repository use `NNConv_old` parameter names (`conv1.root`); map
+  `root.T -> lin.weight` by hand — no compatibility loader ships.
 
 ## Development
 
 ```bash
-uv sync --extra examples --extra notebooks
+uv sync --all-groups
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest
-uv run python examples/swiss_roll.py
-uv run python examples/era5.py
-cd notebooks && uv run python _execute.py
 uv build
 ```
+
+`.vscode/settings.json` points VS Code at `.venv` and adds `src` to Pylance's search path, so the
+integrated terminal, the test runner and IntelliSense all use this project's interpreter with no
+picker step. It is a per-workspace override: if the status bar shows another interpreter, run
+**Python: Select Interpreter** and choose `.venv/bin/python` once.
+
+`examples/` holds a full worked pipeline — the ERA5 demo, its graph generator and the notebooks that
+use them — with `examples/graph_utils.py` as the shared neighbourhood builder worth copying from.
+The examples need the `examples` extra, which pulls `cartopy`, `matplotlib`, `scipy`, `netCDF4` and
+`faiss-cpu`; `nofe` itself needs none of them.
+
+- The `examples` extra pins `netCDF4<1.7.5`: 1.7.5+ publishes only macOS 15 wheels, so macOS 14
+  cannot install it. Its `cartopy` dependency downloads Natural Earth shapefiles on first use into
+  `~/.local/share/cartopy`.
+- `faiss-cpu` is capped below 1.16: 1.16.0 publishes only a `macosx_15_0_arm64` wheel and no sdist,
+  while torch 2.15 supports macOS 14.
+- On macOS the `faiss-cpu` wheel vendors its own `libomp.dylib` and torch ships another; dyld loads
+  both and the second initialisation aborts with `OMP: Error #15`. Run the repair after every
+  `uv sync` (idempotent, a no-op off macOS): `uv run python tools/repair_faiss_omp.py`.

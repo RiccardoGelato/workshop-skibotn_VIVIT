@@ -102,13 +102,21 @@ class NOFE:
 
     @staticmethod
     def _query_candidates(data: Data) -> np.ndarray:
-        """Nodes that have both features and an embedding target."""
-        candidates = np.intersect1d(
-            node_indices(data, "output_mask"), node_indices(data, "input_mask")
-        )
+        """Rows to supervise: ``output_mask`` rows that have a target distribution.
+
+        That is every row when ``y`` supplies truth for all of them — the out-of-sample rows
+        included — and otherwise only the rows with features of their own, because a value without
+        features has no distribution to match. Landmarks still come from ``input_mask``, so the
+        rows being scored never act as senders.
+        """
+        outputs = node_indices(data, "output_mask")
+        if getattr(data, "y", None) is not None:
+            return outputs
+        candidates = np.intersect1d(outputs, node_indices(data, "input_mask"))
         if candidates.size == 0:
             raise ValueError(
-                "the Nyström path needs nodes selected by both input_mask and output_mask"
+                "the Nyström path needs scored rows with features: supply y for the output_mask "
+                "rows, or include rows selected by input_mask in output_mask"
             )
         return candidates
 
@@ -131,8 +139,8 @@ class NOFE:
         scored = torch.as_tensor(output_mask).flatten().to(dtype=torch.bool)
         if bool((scored & ~observed).any()):
             raise ValueError(
-                f"cannot {action} a graph with no ground-truth features; build it with "
-                "query_features=... via nofe.build_graph, or call embed() instead"
+                f"cannot {action} a graph with no ground-truth features; "
+                "build it with query_features=... via your graph builder, or call embed() instead"
             )
 
     def _graph_loss(self, data: Data, prediction: torch.Tensor, mask: torch.Tensor | None):
@@ -287,6 +295,23 @@ class NOFE:
 
     # -- inference --------------------------------------------------------
 
+    def _forward_chunked(self, data: Data, rows: np.ndarray) -> torch.Tensor:
+        """Embed ``rows`` in query chunks, assembling the full graph's predictions.
+
+        Every chunk runs the **full graph** forward pass, because a node's embedding depends on
+        messages from all its neighbours, not on which nodes are being reported. Only the returned
+        rows are chunked, so the output is bit-identical to one pass while peak resident
+        predictions are ``chunk_size x dim``.
+        """
+        chunk = int(self._config["chunk_size"])
+        if chunk >= len(rows):
+            return self.model(data.x, data.edge_index, data.edge_attr)[torch.as_tensor(rows)]
+        pieces = []
+        for start in range(0, len(rows), chunk):
+            piece = self.model(data.x, data.edge_index, data.edge_attr)
+            pieces.append(piece[torch.as_tensor(rows[start : start + chunk])])
+        return torch.cat(pieces)
+
     def _ensure_built(self, data: Data) -> None:
         if self._model is None:
             self.build(data)
@@ -301,8 +326,7 @@ class NOFE:
 
         if self._nystrom() is None:
             with torch.no_grad():
-                prediction = self.model(data.x, data.edge_index, data.edge_attr)
-            return prediction[torch.as_tensor(queries)].detach().cpu()
+                return self._forward_chunked(data, queries).detach().cpu()
 
         sampler = self._sampler()
         inputs = node_indices(data, "input_mask")

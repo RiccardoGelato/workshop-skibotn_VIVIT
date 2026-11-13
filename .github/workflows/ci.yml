@@ -17,6 +17,9 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked --python ${{ matrix.python }} --all-groups
+      # macOS loads faiss's vendored libomp next to torch's; the script symlinks one at the other
+      # and is a no-op elsewhere, so it runs unconditionally. It must precede pytest.
+      - run: uv run python tools/repair_faiss_omp.py
       - run: uv run ruff check .
       - run: uv run pytest
 

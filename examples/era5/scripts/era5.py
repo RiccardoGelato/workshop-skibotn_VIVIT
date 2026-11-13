@@ -12,69 +12,39 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import warnings
 from pathlib import Path
 
 import numpy as np
 
-from nofe import NOFE, build_graph
+from nofe import NOFE
 
-DEFAULT_DATA_DIR = "/Volumes/T7-storage/ERA5/data"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "utilities"))
+from era5_graph import DEFAULT_DATA_DIR, Era5Graph  # noqa: E402
+
 DEFAULT_DATE = "2018-01-01"
-VARIABLES = ("w", "v", "z", "q", "r", "t", "d", "o3", "pv", "u", "vo")
 STRIDE = 2
-K = 10
+# Chord on the unit sphere: a 0.6 degree arc. The example is in-sample, so every node sends, and at
+# stride 2 (258,480 nodes) that measures 17.34 neighbours per receiver, a maximum of 403, no
+# isolated nodes and 4.48M edges. With a fifth of the rows withheld — observed-only senders, the
+# notebooks' regime — the same radius gives a mean of 13.83, 334 max and 205 isolated (0.08%), for
+# 3.58M edges. A 0.5 degree radius (0.00873) is too sparse there: 1,922 isolated nodes (0.74%).
+RADIUS = 0.01047
+NYSTROM = 0.25
 PERCENTILE = 5
 
-DEFAULT_OUTPUT = Path(__file__).with_name("era5_embedding.png")
-CONFIG = {"width": 8, "ker_width": 32, "epochs": 80, "patience": 20, "seed": 0}
-
-
-def load_fields(path: Path, stride: int = STRIDE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Standardised ``[lat, lon, variable]`` block over the globe plus its coordinates."""
-    import netCDF4
-
-    dataset = netCDF4.Dataset(path)
-    try:
-        latitudes = np.asarray(dataset["latitude"][:], dtype=np.float64)
-        longitudes = np.asarray(dataset["longitude"][:], dtype=np.float64)
-        # ERA5 stores longitude in [0, 360) and latitude north to south; both axes are
-        # reordered to increasing order so the block reshapes straight into a raster.
-        longitude_order = np.argsort((longitudes + 180.0) % 360.0 - 180.0)
-        longitudes = ((longitudes + 180.0) % 360.0 - 180.0)[longitude_order]
-        latitude_order = np.argsort(latitudes)
-        latitudes = latitudes[latitude_order]
-
-        # The two pole rows repeat one value along every longitude: keeping them would add
-        # 1440 coincident nodes with zero-length edges. Sample the rest evenly, aligned on
-        # the equator so the two hemispheres are covered symmetrically.
-        usable = np.flatnonzero(np.abs(latitudes) < 90.0)
-        lat_rows = usable[usable.size // 2 % stride :: stride]
-        lon_cols = np.arange(0, longitudes.size, stride)
-
-        channels = []
-        for name in VARIABLES:
-            if name not in dataset.variables:
-                raise SystemExit(f"{path} has no variable {name!r}")
-            field = np.asarray(dataset[name][0, 0], dtype=np.float32)
-            block = field[np.ix_(latitude_order[lat_rows], longitude_order)][:, lon_cols]
-            channels.append((block - block.mean()) / (block.std() + 1e-8))
-    finally:
-        dataset.close()
-    return np.stack(channels, axis=-1), latitudes[lat_rows], longitudes[lon_cols]
-
-
-def unit_sphere(latitudes: np.ndarray, longitudes: np.ndarray) -> np.ndarray:
-    """Lat/lon grid to 3-D unit vectors: the domain the neighbourhood graph lives in.
-
-    Directions on the sphere make the ±180° seam and the pole crossings ordinary
-    neighbours, so a global kNN graph needs no longitude duplication.
-    """
-    phi = np.deg2rad(np.repeat(latitudes, longitudes.size))
-    lam = np.deg2rad(np.tile(longitudes, latitudes.size))
-    return np.stack(
-        [np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)], axis=1
-    ).astype(np.float32)
+DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "era5_embedding.png"
+# chunk_size is the Nyström query chunk. The 8192 default splits 258,480 queries into 32 passes and
+# takes ~185 s/epoch here; 65536 needs ~10 s/epoch for the same result, only more resident memory.
+CONFIG = {
+    "width": 8,
+    "ker_width": 32,
+    "epochs": 80,
+    "patience": 20,
+    "seed": 0,
+    "chunk_size": 65_536,
+}
 
 
 def colour_scale(
@@ -251,28 +221,20 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT, help="destination PNG")
     args = parser.parse_args()
 
-    source = args.data / f"{args.date}.nc"
-    if not source.exists():
-        raise SystemExit(
-            f"no ERA5 file at {source}; set NOFE_ERA5_DATA to the directory that holds "
-            f"<date>.nc (default {DEFAULT_DATA_DIR}) or pass --data"
-        )
-
-    features, latitudes, longitudes = load_fields(source)
+    graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=args.data)
+    features, latitudes, longitudes = graph.load(args.date)
     num_lat, num_lon = features.shape[:2]
-    flat = features.reshape(-1, features.shape[2])
-    positions = unit_sphere(latitudes, longitudes)
-    data = build_graph(positions, flat, neighbor="knn", k=K)
+    data = graph.build(features, latitudes, longitudes)
     print(
-        f"{source.name}: {num_lat}x{num_lon} = {data.num_nodes} nodes over the globe, "
-        f"{flat.shape[1]} variables, {data.num_edges} edges"
+        f"{args.date}.nc: {num_lat}x{num_lon} = {data.num_nodes} nodes over the globe, "
+        f"{features.shape[2]} variables, {data.num_edges} edges"
     )
     print(
         "domain: every ERA5 grid point on the unit sphere; "
         "feature space: the 11 variables at each point"
     )
 
-    model = NOFE(dim=3, config={**CONFIG, "neighbor": "knn", "k": K})
+    model = NOFE(dim=3, config={**CONFIG, "nystrom": NYSTROM})
     history = model.train(data)
     print(
         f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} after "

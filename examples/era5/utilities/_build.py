@@ -1,8 +1,8 @@
 """Generate the workflow notebooks.
 
-Run from the repository root: ``uv run python notebooks/_build.py``.
-Notebook sources live here so the JSON is reproducible; ``notebooks/_execute.py`` then executes
-every notebook to prove the cells run and to embed their outputs.
+Run from the repository root: ``uv run python examples/era5/utilities/_build.py``.
+Notebook sources live here so the JSON is reproducible; the notebooks are written to
+``examples/era5/notebooks/``, which is also where ``_execute.py`` starts its kernels.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import nbformat as nbf
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
 HERE = Path(__file__).resolve().parent
+NOTEBOOKS_DIR = HERE.parent / "notebooks"
 SHARED = """\
 %matplotlib inline
 
@@ -22,14 +23,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.spatial import cKDTree
 
-from nofe import NOFE, build_graph
+from nofe import NOFE
 from nofe.affinity import affinity_kl_loss
 
 # Resolve paths from the repository layout, not the process cwd: VS Code always starts kernels in
 # the workspace folder (`jupyter.notebookFileRoot` is ignored since 2024.4), while `_execute.py`
-# runs from `notebooks/`. Walk up from the cwd looking for the repo root, so both agree.
+# runs from this directory. Walk up from the cwd looking for the repo root, so both agree.
 REPO = next(
     (
         ancestor
@@ -40,8 +40,8 @@ REPO = next(
 )
 if REPO is None:
     raise RuntimeError(f"run this notebook from inside the nofe checkout, not {Path.cwd()}")
-NOTEBOOKS = REPO / "notebooks"
-DATA = NOTEBOOKS / "data"
+ERA5 = REPO / "examples" / "era5"
+DATA = ERA5 / "data"
 
 # The example data is not in Git (21 MB per date), so fail with the fetch command rather than the
 # opaque `StopIteration`/`FileNotFoundError` the loader would otherwise raise.
@@ -53,11 +53,17 @@ if not (DATA / "2018-01-01.nc").exists():
         f"  cp /Volumes/T7-storage/ERA5/data/2018-01-0{{1,2}}.nc {DATA}/"
     )
 
-# The notebooks import the ERA5 helpers straight from the example script, so the loader and the
-# globe plot have exactly one implementation in the repo. `era5` is imported after `sys.path` is
-# extended, which is why the noqa marker below is needed.
+# The notebooks import the ERA5 helpers straight from the example scripts, so the loader, the
+# graph generator and the globe plot have exactly one implementation in the repo. They are
+# imported after `sys.path` is extended, which is why the noqa markers below are needed: the ERA5
+# demo lives in `scripts/`, its graph generator here in `utilities/`, and the shared graph helpers
+# one level up in `examples/`.
+sys.path.insert(0, str(ERA5 / "scripts"))
+sys.path.insert(0, str(ERA5 / "utilities"))
 sys.path.insert(0, str(REPO / "examples"))
 import era5  # noqa: E402
+from era5_graph import Era5Graph  # noqa: E402
+from graph_utils import knn_indices  # noqa: E402
 
 
 def kl(on, embedding) -> float:
@@ -76,9 +82,9 @@ def knn_agreement(reference: torch.Tensor, candidate: torch.Tensor, k: int = 10)
     \"\"\"Mean share of exact k-nearest neighbours two point sets have in common.\"\"\"
     ref = reference.detach().cpu().numpy()
     cand = candidate.detach().cpu().numpy()
-    _, ref_nn = cKDTree(ref).query(ref, k=k + 1)
-    _, cand_nn = cKDTree(cand).query(cand, k=k + 1)
-    shared = [len(set(a) & set(b)) / k for a, b in zip(ref_nn[:, 1:], cand_nn[:, 1:], strict=True)]
+    ref_nn = knn_indices(ref, k)
+    cand_nn = knn_indices(cand, k)
+    shared = [len(set(a) & set(b)) / k for a, b in zip(ref_nn, cand_nn, strict=True)]
     return float(np.mean(shared))
 
 
@@ -87,18 +93,23 @@ def close(a: torch.Tensor, b: torch.Tensor, rtol: float = 1e-4) -> bool:
     return bool((a - b).abs().max() <= rtol * a.abs().max())
 
 
-print("nofe ready; the faiss fallback warning is expected on macOS arm64")
+print("nofe ready")
 """
 
 LOAD = """\
 # STRIDE=8 is the whole globe at 89 x 180 = 16,020 grid points. Lower the stride for a finer
 # grid (4 gives 64,440 nodes, 2 gives the full 258,480-node field).
 STRIDE = 8
-features, latitudes, longitudes = era5.load_fields(DATA / "2018-01-01.nc", stride=STRIDE)
-positions = era5.unit_sphere(latitudes, longitudes)
+# Chord on the unit sphere: a 2.5 degree arc. Under observed-only senders at 20% withheld this
+# gives a mean of 11.37 neighbours per receiver and 16 isolated nodes (0.10%). A 2 degree radius
+# (0.0349) leaves 171 isolated nodes (1.07%), too sparse for a 16,020-node demo.
+RADIUS = 0.04363
+NYSTROM = 0.25
+graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
+features, latitudes, longitudes = graph.load("2018-01-01")
 flat = features.reshape(-1, features.shape[2])
 print(
-    f"grid {features.shape[0]}x{features.shape[1]} -> {positions.shape[0]} nodes, "
+    f"grid {features.shape[0]}x{features.shape[1]} -> {flat.shape[0]} nodes, "
     f"{flat.shape[1]} variables each"
 )
 """
@@ -112,6 +123,7 @@ CONFIG = {
     "early_stopping": False,
     "verbose": True,
     "log_every": 50,
+    "nystrom": NYSTROM,
 }"""
 
 CONFIG_DOC = """\
@@ -151,7 +163,7 @@ in_sample = notebook(
 
 The simplest workflow. Every grid point has features, so nothing is withheld:
 
-- `build_graph(positions, features)` returns a `Data` with **no** `input_mask`, `output_mask` or
+- `graph.build(features, lat, lon)` returns a `Data` with **no** `input_mask`, `output_mask` or
   `y`.
 - `train` scores every row. The internal train/validation split chooses which rows enter the
   objective; it never hides neighbours.
@@ -164,22 +176,22 @@ This is the baseline the other two notebooks build on."""
             """\
 ## Load one date at coarse resolution
 
-`era5.load_fields` standardises each variable per field and drops the two duplicated pole rows;
-`era5.unit_sphere` turns lat/lon into 3-D unit vectors, so the ±180° seam and the poles are
-ordinary neighbours for the kNN graph."""
+`Era5Graph.load` standardises each variable per field and drops the two duplicated pole rows.
+`Era5Graph.positions` turns lat/lon into 3-D unit vectors (in earth radii), so the ±180° seam and
+the poles are ordinary neighbours for the radius graph."""
         ),
         new_code_cell(LOAD),
         new_markdown_cell(
             """\
 ## Build the graph
 
-`neighbor="knn", k=10` matches the ERA5 example. Edges are built once, here; the operator only
-consumes `edge_index`/`edge_attr`, so a radius neighbourhood works identically
-(`neighbor="radius", radius=0.05` on the unit sphere)."""
+`Era5Graph` is radius-only: every observed row within `RADIUS` of a receiver sends it a message.
+Edges are built once, here; the operator only consumes `edge_index`/`edge_attr`, so any other
+neighbourhood you assemble works identically."""
         ),
         new_code_cell(
             """\
-data = build_graph(positions, flat, neighbor="knn", k=era5.K)
+data = graph.build(features, latitudes, longitudes)
 print(data)
 print(
     "masks:",
@@ -306,17 +318,17 @@ held_out = notebook(
             """\
 # 2 — Withhold locations, train on a merged graph, predict two ways
 
-Out-of-sample embedding: some locations have no features. `build_graph` merges **locations, not
-features** — the node set is `positions ∪ query_positions`, the added rows get a `fill` substitute
-in `x`, keep their truth in `y`, and receive messages without sending any (`input_mask=False`).
+Out-of-sample embedding: some locations have no features. The generator merges **locations, not
+features** — the node set is every grid point, observed rows first and the withheld ones after, the
+added rows get a `fill` substitute in `x`, keep their truth in `y`, and receive messages without
+sending any (`input_mask=False`).
 
-Three graphs come out of one date:
+Two graphs come out of one date:
 
 |Graph|Built with|What it can do|
 |---|---|---|
-|`observed`|`build_graph(p, f)` on the retained rows|in-sample baseline|
-|`merged`|`+ query_positions=q, query_features=fq`|train with truth for both parts|
-|`blind`|`+ query_positions=q` only|true out-of-sample: `embed` only|
+|`merged`|`query_mask=withheld, query_features=f`|train with truth for both parts|
+|`blind`|`query_mask=withheld` only|true out-of-sample: `embed` only|
 
 The last sections train on `merged` and predict twice on the **same coarse graph**: once for the
 observed rows only, once for every location."""
@@ -345,7 +357,7 @@ def split_nodes(num_nodes: int, fraction: float, seed: int = 0) -> tuple[np.ndar
 
 
 HELD_OUT = 0.2
-observed_mask, withheld_mask = split_nodes(positions.shape[0], HELD_OUT)
+observed_mask, withheld_mask = split_nodes(flat.shape[0], HELD_OUT)
 num_observed = int(observed_mask.sum())
 print(
     f"observed {num_observed}  withheld {int(withheld_mask.sum())}  "
@@ -356,37 +368,26 @@ assert withheld_mask.any() and observed_mask.any()
         ),
         new_markdown_cell(
             """\
-## Build the three graphs
+## Build the two graphs
 
-`observed` holds the retained rows only. `merged` adds the withheld locations and keeps their
-truth in `y`. `blind` is the same node set without `y`, which is exactly what inference looks like
-when no truth exists.
+`merged` keeps the withheld rows' truth in `y`. `blind` is the same graph without `y`, which is
+exactly what inference looks like when no truth exists.
 
 `merged` and `blind` are bit-identical apart from `y`: same `x`, `pos`, `input_mask` and
 `edge_index`. That is the training/inference parity guarantee."""
         ),
         new_code_cell(
             """\
-observed = build_graph(positions[observed_mask], flat[observed_mask], neighbor="knn", k=era5.K)
-merged = build_graph(
-    positions[observed_mask],
-    flat[observed_mask],
-    query_positions=positions[withheld_mask],
-    query_features=flat[withheld_mask],
-    neighbor="knn",
-    k=era5.K,
-)
-blind = build_graph(
-    positions[observed_mask],
-    flat[observed_mask],
-    query_positions=positions[withheld_mask],
-    neighbor="knn",
-    k=era5.K,
-)
+# `query_mask` names the withheld rows; `merged` and `blind` differ only in whether their truth is
+# supplied. An observed-rows-only view is a restricted `output_mask` on the same graph (below), not
+# a separate graph: building one on the retained rows alone would give it different edges.
+merged = graph.build(features, latitudes, longitudes,
+                     query_mask=withheld_mask, query_features=features)
+blind = graph.build(features, latitudes, longitudes, query_mask=withheld_mask)
 
-for name, graph in (("observed", observed), ("merged", merged), ("blind", blind)):
-    truth = "yes" if getattr(graph, "y", None) is not None else "no"
-    print(f"{name:9s} nodes {graph.num_nodes:6d}  edges {graph.num_edges:7d}  y {truth}")
+for label, built in (("merged", merged), ("blind", blind)):
+    truth = "yes" if getattr(built, "y", None) is not None else "no"
+    print(f"{label:9s} nodes {built.num_nodes:6d}  edges {built.num_edges:7d}  y {truth}")
 
 print(
     "merged/blind differ only in y:",
@@ -419,11 +420,8 @@ print(
     torch.equal(merged.x[:num_observed], merged.y[:num_observed]),
 )
 for mode in ("interpolate", "zeros", "mean"):
-    candidate = build_graph(
-        positions[observed_mask],
-        flat[observed_mask],
-        query_positions=positions[withheld_mask],
-        fill=mode,
+    candidate = graph.build(
+        features, latitudes, longitudes, query_mask=withheld_mask, fill=mode
     )
     delta = (candidate.x[added] - merged.y[added]).abs().mean()
     print(f"fill={mode:12s} mean abs error on the added rows: {delta:.4f}")
@@ -433,8 +431,9 @@ for mode in ("interpolate", "zeros", "mean"):
             """\
 ## Train on the merged graph
 
-The loss is the KL divergence against `y` — real features for **both** the observed and withheld
-rows — while the model only ever sees the substitute on the withheld ones.
+`y` carries real features for **both** the observed and the withheld rows, while the model only ever
+sees the substitute on the withheld ones. The Nyström objective scores every `output_mask` row from
+`y`, out-of-sample rows included; only the senders are restricted to `input_mask`.
 
 `blind` is refused by `train`/`loss`: its scored rows hold substitutes and there is no truth to
 score them against. `embed` still works on it.
@@ -500,8 +499,9 @@ print("observed-only rows are the matching prefix of the full prediction: True")
             """\
 ## Score both predictions
 
-`loss` scores the `output_mask` rows and reads the truth from `y`. The full view includes the
-withheld points, so the difference between the two numbers is the out-of-sample cost.
+`loss` scores the `output_mask` rows and reads the truth from `y`, on both operators. The full view
+includes the withheld points — their truth is in `y` even though `x` holds only the substitute — so
+the difference between the two numbers is the out-of-sample cost.
 
 The contract requires `input_mask ⊆ output_mask`, so the withheld points cannot be scored *alone*:
 observed-rows-only and every-row are the two supported views."""
@@ -533,16 +533,24 @@ hidden, so the scattered points the model had to extrapolate stand out."""
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
-grid_index = np.empty(merged.num_nodes, dtype=np.int64)
-grid_index[observed_mask] = np.arange(num_observed)
-grid_index[withheld_mask] = np.arange(num_observed, merged.num_nodes)
+# `merged` is ordered known-first, so a graph row's id is not its grid id: the generator reports
+# the grid id of every row through `observed_index`/`withheld_index`, and this array is the
+# graph-row -> grid-id map the scatter needs.
+row_grid = np.empty(merged.num_nodes, dtype=np.int64)
+row_grid[:num_observed] = merged.observed_index.numpy()
+row_grid[num_observed:] = merged.withheld_index.numpy()
 
 
 def to_grid(graph_rows: torch.Tensor) -> np.ndarray:
     \"\"\"Graph-order embedding rows back into the original lat/lon raster order.\"\"\"
-    values = np.full((grid_index.size, 3), np.nan, dtype=np.float32)
-    values[grid_index] = graph_rows.detach().cpu().numpy()
+    values = np.full((row_grid.size, 3), np.nan, dtype=np.float32)
+    values[row_grid] = graph_rows.detach().cpu().numpy()
     return values
+
+
+# A permuted scatter still fills the raster and still draws a plausible globe, so check the truth
+# features land back where they came from before reading anything into the picture.
+assert np.allclose(to_grid(merged.y[:, :3]), flat[:, :3], atol=1e-4), "grid scatter is permuted"
 
 
 full_grid = to_grid(all_locations)
@@ -606,10 +614,10 @@ This notebook trains on **2018-01-01** and embeds **2018-01-02**, whose network 
 Two inference inputs are shown:
 
 1. **fully observed** — the new date is complete, so it embeds `num_nodes` rows;
-2. **partly observed** — half its locations are withheld and supplied as `query_positions`, which
-   is what deployment looks like when new locations arrive without features.
+2. **partly observed** — half its locations are withheld through `query_mask`, which is what
+   deployment looks like when new locations arrive without features.
 
-Both files are in `notebooks/data/`."""
+Both files are in `examples/era5/data/`."""
         ),
         new_code_cell(SHARED),
         new_markdown_cell(
@@ -622,24 +630,20 @@ transfer to work."""
         new_code_cell(
             """\
 STRIDE = 8
-train_features, train_latitudes, train_longitudes = era5.load_fields(
-    DATA / "2018-01-01.nc", stride=STRIDE
-)
-test_features, test_latitudes, test_longitudes = era5.load_fields(
-    DATA / "2018-01-02.nc", stride=STRIDE
-)
+# Chord on the unit sphere: a 2.5 degree arc, the same neighbourhood as notebook 1.
+RADIUS = 0.04363
+NYSTROM = 0.25
+graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
+train_features, train_latitudes, train_longitudes = graph.load("2018-01-01")
+test_features, test_latitudes, test_longitudes = graph.load("2018-01-02")
 assert np.array_equal(train_latitudes, test_latitudes)
 assert np.array_equal(train_longitudes, test_longitudes)
 
-positions_train = era5.unit_sphere(train_latitudes, train_longitudes)
-positions_test = era5.unit_sphere(test_latitudes, test_longitudes)
-flat_train = train_features.reshape(-1, train_features.shape[2])
-flat_test = test_features.reshape(-1, test_features.shape[2])
 print(
     "training date nodes:",
-    positions_train.shape[0],
+    train_features.shape[0] * train_features.shape[1],
     "| new date nodes:",
-    positions_test.shape[0],
+    test_features.shape[0] * test_features.shape[1],
 )
 """
         ),
@@ -648,7 +652,7 @@ print(
             CONFIG
             + """
 
-train_graph = build_graph(positions_train, flat_train, neighbor="knn", k=era5.K)
+train_graph = graph.build(train_features, train_latitudes, train_longitudes)
 model = NOFE(dim=3, config=CONFIG)
 history = model.train(train_graph)
 print(
@@ -662,12 +666,12 @@ print(
 ## Predict on the second date, fully observed
 
 The new graph carries its own `x`, `pos` and edges. The only compatibility requirement is the
-widths: 11 input features and `2P + 1 = 7` edge channels, which `build_graph` reproduces for any
+widths: 11 input features and `2P + 1 = 7` edge channels, which the generator reproduces for any
 point set of the same dimension."""
         ),
         new_code_cell(
             """\
-test_graph = build_graph(positions_test, flat_test, neighbor="knn", k=era5.K)
+test_graph = graph.build(test_features, test_latitudes, test_longitudes)
 built = model.model.config
 print(
     "feature width matches:",
@@ -706,32 +710,24 @@ print("transfer beats linear PCA on the unseen date: True")
             """\
 ## Partly observed second date
 
-Withhold half the locations of 2018-01-02 and hand them to `build_graph` as `query_positions`.
+Withhold half the locations of 2018-01-02 and pass that mask to the generator as `query_mask`.
 Their features become the `fill` substitute, they receive messages without sending any, and their
-truth — when supplied — goes to `y` for scoring only.
+truth — when supplied as `query_features` — goes to `y` for scoring only.
 
 `test_blind` is the honest deployment case: no truth exists for the new locations."""
         ),
         new_code_cell(
             """\
 rng = np.random.default_rng(0)
-observed_test = rng.random(positions_test.shape[0]) < 0.5
+observed_test = rng.random(test_latitudes.size * test_longitudes.size) < 0.5
 print(f"observed {observed_test.sum()} of {observed_test.size} locations on the second date")
 
-test_merged = build_graph(
-    positions_test[observed_test],
-    flat_test[observed_test],
-    query_positions=positions_test[~observed_test],
-    query_features=flat_test[~observed_test],
-    neighbor="knn",
-    k=era5.K,
+test_merged = graph.build(
+    test_features, test_latitudes, test_longitudes,
+    query_mask=~observed_test, query_features=test_features,
 )
-test_blind = build_graph(
-    positions_test[observed_test],
-    flat_test[observed_test],
-    query_positions=positions_test[~observed_test],
-    neighbor="knn",
-    k=era5.K,
+test_blind = graph.build(
+    test_features, test_latitudes, test_longitudes, query_mask=~observed_test
 )
 print(
     "merged and blind agree on the graph:",
@@ -781,12 +777,18 @@ locations withheld and predicted."""
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
-grid_index_test = np.empty(test_merged.num_nodes, dtype=np.int64)
-grid_index_test[observed_test] = np.arange(num_observed_test)
-grid_index_test[~observed_test] = np.arange(num_observed_test, test_merged.num_nodes)
-
-predicted_grid = np.full((grid_index_test.size, 3), np.nan, dtype=np.float32)
-predicted_grid[grid_index_test] = predicted.numpy()
+# `predicted` is in graph order (known rows first), so it needs the graph-row -> grid-id map
+# before it can be drawn; `test_merged.y` is the check that the map points the right way.
+row_grid_test = np.empty(test_merged.num_nodes, dtype=np.int64)
+row_grid_test[:num_observed_test] = test_merged.observed_index.numpy()
+row_grid_test[num_observed_test:] = test_merged.withheld_index.numpy()
+predicted_grid = np.full((row_grid_test.size, 3), np.nan, dtype=np.float32)
+predicted_grid[row_grid_test] = predicted.numpy()
+# A permuted scatter still looks like a globe, so pin it against the truth before reading the map.
+test_flat = test_features.reshape(-1, test_features.shape[2])
+check = np.full((row_grid_test.size, 3), np.nan, dtype=np.float32)
+check[row_grid_test] = test_merged.y[:, :3].numpy()
+assert np.allclose(check, test_flat[:, :3], atol=1e-4), "grid scatter is permuted"
 
 panels = [
     ("2018-01-01 (training)", train_embedding.numpy()),
@@ -834,10 +836,10 @@ NOTEBOOKS = (
 
 if __name__ == "__main__":
     for name, book in NOTEBOOKS:
-        target = HERE / name
+        target = NOTEBOOKS_DIR / name
         nbf.write(book, target)
-        print(f"wrote {target.relative_to(HERE.parent)} ({len(book.cells)} cells)")
-    # The data directory is data only; no stray artefacts should survive a build.
-    for stray in HERE.glob("*.pt"):
+        print(f"wrote {target.relative_to(HERE.parent.parent)} ({len(book.cells)} cells)")
+    # The notebooks directory is notebooks only; no stray artefacts should survive a build.
+    for stray in NOTEBOOKS_DIR.glob("*.pt"):
         stray.unlink()
     del shutil

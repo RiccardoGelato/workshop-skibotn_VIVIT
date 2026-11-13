@@ -10,11 +10,7 @@ DEFAULTS: dict[str, Any] = {
     "width": 32,
     "ker_width": 64,
     "depth": 3,
-    "edge_batch_size": 32_768,
-    # graph construction
-    "neighbor": "radius",
-    "radius": 1.0,
-    "k": 10,
+    "edge_batch_size": 65_536,
     # training
     "epochs": 200,
     "lr": 1e-2,
@@ -35,18 +31,16 @@ DEFAULTS: dict[str, Any] = {
 
 _RESERVED = ("dim",)
 _DEVICES = ("auto", "cpu", "cuda", "mps")
-_CHOICES: dict[str, tuple[str, ...]] = {"neighbor": ("radius", "knn")}
 
 _POSITIVE_INTS = (
     "width",
     "ker_width",
     "depth",
     "epochs",
-    "k",
     "log_every",
     "chunk_size",
 )
-_POSITIVE_FLOATS = ("lr", "weight_decay", "min_delta", "radius")
+_POSITIVE_FLOATS = ("lr", "weight_decay", "min_delta")
 
 
 def _validate(key: str, value: Any) -> None:
@@ -56,9 +50,6 @@ def _validate(key: str, value: Any) -> None:
     elif key in _POSITIVE_FLOATS:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{key} must be a positive float, got {value!r}")
-    elif key in _CHOICES:
-        if value not in _CHOICES[key]:
-            raise ValueError(f"{key} must be one of {_CHOICES[key]}, got {value!r}")
     elif key == "val_fraction":
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value < 1:
             raise ValueError(f"val_fraction must be in (0, 1), got {value!r}")

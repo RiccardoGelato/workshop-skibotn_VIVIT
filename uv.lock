@@ -1890,11 +1890,8 @@ name = "nofe"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "faiss-cpu" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
     { name = "torch-geometric" },
 ]
@@ -1902,29 +1899,39 @@ dependencies = [
 [package.optional-dependencies]
 examples = [
     { name = "cartopy" },
+    { name = "faiss-cpu" },
     { name = "matplotlib" },
     { name = "netcdf4" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 notebooks = [
     { name = "cartopy" },
+    { name = "faiss-cpu" },
     { name = "ipykernel" },
     { name = "matplotlib" },
     { name = "nbclient" },
     { name = "nbformat" },
     { name = "netcdf4" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "faiss-cpu" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "cartopy", marker = "extra == 'examples'", specifier = ">=0.24" },
     { name = "cartopy", marker = "extra == 'notebooks'", specifier = ">=0.24" },
-    { name = "faiss-cpu", specifier = ">=1.15,<1.16" },
+    { name = "faiss-cpu", marker = "extra == 'examples'", specifier = ">=1.11,<1.16" },
+    { name = "faiss-cpu", marker = "extra == 'notebooks'", specifier = ">=1.11,<1.16" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6.29" },
     { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.9" },
     { name = "matplotlib", marker = "extra == 'notebooks'", specifier = ">=3.9" },
@@ -1933,7 +1940,8 @@ requires-dist = [
     { name = "netcdf4", marker = "extra == 'examples'", specifier = ">=1.7.4,<1.7.5" },
     { name = "netcdf4", marker = "extra == 'notebooks'", specifier = ">=1.7.4,<1.7.5" },
     { name = "numpy", specifier = ">=2.0" },
-    { name = "scipy", specifier = ">=1.13" },
+    { name = "scipy", marker = "extra == 'examples'", specifier = ">=1.13" },
+    { name = "scipy", marker = "extra == 'notebooks'", specifier = ">=1.13" },
     { name = "torch", specifier = ">=2.6,<3" },
     { name = "torch-geometric", specifier = ">=2.6" },
 ]
@@ -1941,8 +1949,10 @@ provides-extras = ["examples", "notebooks"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "faiss-cpu", specifier = ">=1.11,<1.16" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.9" },
+    { name = "scipy", specifier = ">=1.13" },
 ]
 
 [[package]]
