@@ -65,6 +65,62 @@ def _flat_index(points: np.ndarray, sources: np.ndarray) -> faiss.IndexFlatL2:
     return index
 
 
+def tiled_radius_edges(
+    points: Tensor | np.ndarray,
+    radius: float,
+    *,
+    rows: int,
+    cols: int,
+    band: int = 32,
+    halo: int = 6,
+) -> tuple[Tensor, Tensor]:
+    """Radius pairs for a ``rows x cols`` raster, searched one latitude band at a time.
+
+    ``points`` is row-major over the raster (``index = lat_row * cols + lon_col``). Band ``b``'s
+    queries are matched only against rows ``b`` +/- ``halo``, which is exact for any radius that
+    cannot span more than ``halo`` rows — true for every ERA5 setting here (the widest, 2.5 deg at
+    0.25 deg spacing, spans 10 rows). Longitude needs no halo: every row keeps all ``cols`` columns.
+
+    Returns ``(neighbor, query)`` int64 tensors sorted by ``(query, neighbor)``, the same order and
+    dtypes :func:`radius_edges` returns.
+    """
+    values = _as_points(points)
+    if rows * cols != values.shape[0]:
+        raise ValueError(
+            f"rows * cols = {rows * cols} must match the {values.shape[0]} points of a "
+            f"{rows} x {cols} raster"
+        )
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+
+    neighbor_parts: list[np.ndarray] = []
+    query_parts: list[np.ndarray] = []
+    for start in range(0, rows, band):
+        stop = min(start + band, rows)
+        lo = max(0, start - halo)
+        hi = min(rows, stop + halo)
+        index = _flat_index(values, np.arange(lo * cols, hi * cols))
+        query_points = np.ascontiguousarray(values[start * cols : stop * cols], dtype=np.float32)
+        # L2 search reports squared distances, so the search radius is squared.
+        limits, _, found = index.range_search(query_points, float(radius) ** 2)
+        counts = np.diff(limits.astype(np.int64))
+        recv = np.repeat(np.arange(start * cols, stop * cols, dtype=np.int64), counts)
+        # The index holds rows ``lo * cols`` onwards, so shift the hits back to global ids.
+        src = found.astype(np.int64) + lo * cols
+        keep = src != recv
+        neighbor_parts.append(src[keep])
+        query_parts.append(recv[keep])
+
+    neighbor = np.concatenate(neighbor_parts)
+    query = np.concatenate(query_parts)
+    if neighbor.size == 0:
+        empty = torch.zeros(0, dtype=torch.long)
+        return empty, empty.clone()
+    # Sorted by (target, source) across all bands, so the banding leaves no trace in the output.
+    order = np.lexsort((neighbor, query))
+    return torch.from_numpy(neighbor[order]), torch.from_numpy(query[order])
+
+
 def _pairs(
     points: np.ndarray,
     sources: np.ndarray,
@@ -83,23 +139,19 @@ def _pairs(
     if radius is not None:
         # L2 search reports squared distances, so the search radius is squared.
         limits, _, found = index.range_search(query_points, float(radius) ** 2)
-        neighbor: list[int] = []
-        query: list[int] = []
-        for i, target in enumerate(targets.tolist()):
-            for j in found[limits[i] : limits[i + 1]].tolist():
-                source = int(sources[j])
-                if source == target:
-                    continue
-                neighbor.append(source)
-                query.append(target)
-        if not neighbor:
+        # ``limits`` is uint64 and ``np.repeat`` refuses it against an int64 index otherwise.
+        counts = np.diff(limits.astype(np.int64))
+        query = np.repeat(np.asarray(targets, dtype=np.int64), counts)
+        # ``found`` holds index rows, whose ids are ``sources``; map them back to node ids.
+        neighbor = np.asarray(sources, dtype=np.int64)[found]
+        keep = neighbor != query
+        query, neighbor = query[keep], neighbor[keep]
+        if neighbor.size == 0:
             return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
         # Sorted by (target, source): deterministic edge order, so graphs are reproducible.
-        ordered = sorted(zip(query, neighbor, strict=True))
-        return (
-            np.asarray([source for _, source in ordered], dtype=np.int64),
-            np.asarray([target for target, _ in ordered], dtype=np.int64),
-        )
+        # ``lexsort``'s primary key is the last argument, matching ``sorted(zip(query, neighbor))``.
+        order = np.lexsort((neighbor, query))
+        return neighbor[order].astype(np.int64), query[order].astype(np.int64)
 
     assert k is not None
     kk = min(k + 1, len(sources))
@@ -170,6 +222,41 @@ def radius_edges(
     src = None if sources is None else np.asarray(sources, dtype=np.int64)
     dst = None if targets is None else np.asarray(targets, dtype=np.int64)
     return _build(pos, sources=src, targets=dst, radius=float(radius))
+
+
+def raster_radius_edges(
+    pos: Tensor | np.ndarray,
+    radius: float,
+    *,
+    rows: int,
+    cols: int,
+    sources: Tensor | np.ndarray | None = None,
+    targets: Tensor | np.ndarray | None = None,
+) -> tuple[Tensor, Tensor]:
+    """``(neighbor, query)`` radius pairs for a full raster, via :func:`tiled_radius_edges`.
+
+    The banded search is exact only when every row both sends and receives, so anything narrower
+    falls back to the untiled ``radius_edges``: a restricted sender/receiver set is the merged
+    workflow, whose query set is small enough for the full search. Both paths return the same
+    ``(neighbor, query)`` int64 tensors.
+    """
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+    points = _as_points(pos)
+    every_row = np.arange(points.shape[0], dtype=np.int64)
+
+    def _is_every_row(ids: Tensor | np.ndarray | None) -> bool:
+        return ids is None or np.array_equal(np.asarray(ids, dtype=np.int64), every_row)
+
+    if _is_every_row(sources) and _is_every_row(targets):
+        return tiled_radius_edges(pos, radius, rows=rows, cols=cols)
+    neighbor, query = _pairs(
+        points,
+        every_row if sources is None else np.asarray(sources, dtype=np.int64),
+        every_row if targets is None else np.asarray(targets, dtype=np.int64),
+        radius=float(radius),
+    )
+    return torch.from_numpy(neighbor), torch.from_numpy(query)
 
 
 def knn_edges(

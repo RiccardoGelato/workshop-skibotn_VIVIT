@@ -24,13 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "utilities"))
 from era5_graph import DEFAULT_DATA_DIR, Era5Graph  # noqa: E402
 
 DEFAULT_DATE = "2018-01-01"
-STRIDE = 2
-# Chord on the unit sphere: a 0.6 degree arc. The example is in-sample, so every node sends, and at
-# stride 2 (258,480 nodes) that measures 17.34 neighbours per receiver, a maximum of 403, no
-# isolated nodes and 4.48M edges. With a fifth of the rows withheld — observed-only senders, the
-# notebooks' regime — the same radius gives a mean of 13.83, 334 max and 205 isolated (0.08%), for
-# 3.58M edges. A 0.5 degree radius (0.00873) is too sparse there: 1,922 isolated nodes (0.74%).
-RADIUS = 0.01047
+TRAIN_STRIDE = 8
+# Chords on the unit sphere, one per grid resolution, each giving ~12-14 neighbours per receiver.
+# The radius has to shrink with the stride: the 2.5 degree chord at stride 1 would be ~917M edges.
+TRAIN_RADIUS = 0.04363
+INFER_STRIDE = 1
+INFER_RADIUS = 0.005454
 NYSTROM = 0.25
 PERCENTILE = 5
 
@@ -219,14 +218,26 @@ def main() -> None:
         help="file stem to read, e.g. 2018-01-01 (env: NOFE_ERA5_DATE)",
     )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT, help="destination PNG")
+    parser.add_argument(
+        "--train-stride",
+        type=int,
+        default=TRAIN_STRIDE,
+        help=f"grid stride the model trains on (default {TRAIN_STRIDE}: 16,020 nodes)",
+    )
+    parser.add_argument(
+        "--infer-stride",
+        type=int,
+        default=INFER_STRIDE,
+        help=f"grid stride the model embeds (default {INFER_STRIDE}: 1,035,360 nodes)",
+    )
     args = parser.parse_args()
 
-    graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=args.data)
+    graph = Era5Graph(radius=TRAIN_RADIUS, stride=args.train_stride, data_dir=args.data)
     features, latitudes, longitudes = graph.load(args.date)
-    num_lat, num_lon = features.shape[:2]
+    train_lat, train_lon = features.shape[:2]
     data = graph.build(features, latitudes, longitudes)
     print(
-        f"{args.date}.nc: {num_lat}x{num_lon} = {data.num_nodes} nodes over the globe, "
+        f"{args.date}.nc: {train_lat}x{train_lon} = {data.num_nodes} nodes over the globe, "
         f"{features.shape[2]} variables, {data.num_edges} edges"
     )
     print(
@@ -241,11 +252,36 @@ def main() -> None:
         f"{len(history)} epochs (best val {model.best_val_loss:.6f})"
     )
 
-    embedding = model.embed(data).numpy()
+    # Training needs the whole edge set resident; inference is one forward pass, so the finer graph
+    # is embedded without ever being trained on.
+    if args.infer_stride == args.train_stride:
+        infer_data = data
+        embedding = model.embed(data).numpy()
+        plot_lat, plot_lon = latitudes, longitudes
+        num_lat, num_lon = train_lat, train_lon
+    else:
+        infer_graph = Era5Graph(radius=INFER_RADIUS, stride=args.infer_stride, data_dir=args.data)
+        fine_features, fine_lat, fine_lon = infer_graph.load(args.date)
+        num_lat, num_lon = fine_features.shape[:2]
+        infer_data = infer_graph.build(fine_features, fine_lat, fine_lon, radius=INFER_RADIUS)
+        embedding = model.embed(infer_data).numpy()
+        plot_lat, plot_lon = fine_lat, fine_lon
+    # Scored on the training graph: the fine grid is embed-only, and its KL would need truth for
+    # every fine row.
     mean_kl = model.loss(data)
-    print(f"embedding {tuple(embedding.shape)}; mean KL {mean_kl:.6f}")
+    print(
+        f"embedding {tuple(embedding.shape)} on the stride-{args.infer_stride} grid; "
+        f"mean KL on the training graph {mean_kl:.6f}"
+    )
 
-    plot(latitudes, longitudes, embedding, f"ERA5 {args.date} 500 hPa, global", args.out)
+    plot(
+        plot_lat,
+        plot_lon,
+        embedding,
+        f"ERA5 {args.date} 500 hPa, train stride {args.train_stride} -> "
+        f"infer stride {args.infer_stride}",
+        args.out,
+    )
     image_bytes = args.out.stat().st_size
     print(f"wrote {args.out} ({image_bytes / 1024:.0f} KiB)")
 
@@ -254,7 +290,7 @@ def main() -> None:
     assert history[-1]["train_loss"] < 0.02, history[-1]["train_loss"]
     assert model.best_val_loss < 0.02, model.best_val_loss
     assert mean_kl < 0.02, mean_kl
-    assert embedding.shape == (data.num_nodes, 3)
+    assert embedding.shape == (infer_data.num_nodes, 3)
     assert spread.min() > 0.05, spread
     # One RGBA colour per grid point, all opaque (the demo map has no holes).
     assert colours.shape == (num_lat * num_lon, 4), colours.shape

@@ -97,15 +97,18 @@ print("nofe ready")
 """
 
 LOAD = """\
-# STRIDE=8 is the whole globe at 89 x 180 = 16,020 grid points. Lower the stride for a finer
-# grid (4 gives 64,440 nodes, 2 gives the full 258,480-node field).
-STRIDE = 8
-# Chord on the unit sphere: a 2.5 degree arc. Under observed-only senders at 20% withheld this
-# gives a mean of 11.37 neighbours per receiver and 16 isolated nodes (0.10%). A 2 degree radius
-# (0.0349) leaves 171 isolated nodes (1.07%), too sparse for a 16,020-node demo.
-RADIUS = 0.04363
+# TRAIN_STRIDE=8 is the whole globe at 89 x 180 = 16,020 grid points. Lower the stride for a finer
+# grid (4 -> 64,440, 3 -> 114,720, 2 -> 258,480, 1 -> 719 x 1440 = 1,035,360).
+TRAIN_STRIDE = 8
+# Chord on the unit sphere: a 2.5 degree arc. At stride 8 under observed-only senders at 20%
+# withheld this gives a mean of 11.37 neighbours per receiver and 16 isolated nodes (0.10%).
+TRAIN_RADIUS = 0.04363
+# Inference grid and the chord that keeps the same mean degree there. The radius must shrink with
+# the stride: 2.5 degrees at stride 1 would be ~917M edges (~40 GB), which cannot be built.
+INFER_STRIDE = 1
+INFER_RADIUS = 0.005454
 NYSTROM = 0.25
-graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
+graph = Era5Graph(radius=TRAIN_RADIUS, stride=TRAIN_STRIDE, data_dir=DATA)
 features, latitudes, longitudes = graph.load("2018-01-01")
 flat = features.reshape(-1, features.shape[2])
 print(
@@ -185,9 +188,9 @@ the poles are ordinary neighbours for the radius graph."""
             """\
 ## Build the graph
 
-`Era5Graph` is radius-only: every observed row within `RADIUS` of a receiver sends it a message.
-Edges are built once, here; the operator only consumes `edge_index`/`edge_attr`, so any other
-neighbourhood you assemble works identically."""
+`Era5Graph` is radius-only: every observed row within `TRAIN_RADIUS` of a receiver sends it a
+message. Edges are built once, here; the operator only consumes `edge_index`/`edge_attr`, so any
+other neighbourhood you assemble works identically."""
         ),
         new_code_cell(
             """\
@@ -262,10 +265,11 @@ cannot flatten the whole field to grey."""
         ),
         new_code_cell(
             """\
+import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
 figure = era5.globe_figure(
-    latitudes, longitudes, embedding.numpy(), f"2018-01-01, stride {STRIDE}: in-sample"
+    latitudes, longitudes, embedding.numpy(), f"2018-01-01, stride {TRAIN_STRIDE}: in-sample"
 )
 plt.show()
 """
@@ -294,6 +298,72 @@ print(
 assert close(embedding, rebuilt), "reload must reproduce the embedding"
 print("round trip reproducible within relative tolerance: True")
 path.unlink()
+"""
+        ),
+        new_markdown_cell(
+            """\
+## Part B — train coarse, infer fine
+
+Training needs the whole edge set resident at once, because the objective sees every neighbour on
+every epoch. Inference does not: it is one forward pass per chunk, so it can cover a grid whose
+graph could never be held alongside the optimiser.
+
+So train on the coarse grid and embed a finer one. `build(..., radius=)` overrides the constructor's
+chord for a single call, and the fine graph is never trained on."""
+        ),
+        new_code_cell(
+            """\
+fine = Era5Graph(radius=INFER_RADIUS, stride=INFER_STRIDE, data_dir=DATA)
+fine_features, fine_latitudes, fine_longitudes = fine.load("2018-01-01")
+fine_data = fine.build(
+    fine_features, fine_latitudes, fine_longitudes, radius=INFER_RADIUS
+)
+print(f"fine grid: {fine_data.num_nodes} nodes, {fine_data.num_edges} edges")
+print(
+    "mean in-degree:",
+    float(torch.bincount(fine_data.edge_index[1], minlength=fine_data.num_nodes).float().mean()),
+)
+fine_embedding = model.embed(fine_data)
+print("fine embedding:", tuple(fine_embedding.shape))
+assert fine_embedding.shape == (fine_data.num_nodes, 3)
+assert torch.isfinite(fine_embedding).all()
+"""
+        ),
+        new_markdown_cell(
+            """\
+`embed` never consults the graph it was trained on: it reads `x`, `edge_index` and `edge_attr` from
+whatever `Data` it is handed. The only requirement is matching widths — 11 input features and
+`2P + 1 = 7` edge channels — which `Era5Graph` reproduces at any stride, so a coarse model embeds a
+grid it has never seen."""
+        ),
+        new_code_cell(
+            """\
+# One scale from the coarse embedding so both panels are directly comparable: per-panel rescaling
+# would give the same weather regime a different colour on the two grids.
+scale = era5.colour_scale(embedding.numpy(), era5.PERCENTILE)
+panels = [
+    (
+        f"stride {TRAIN_STRIDE} ({data.num_nodes} nodes, trained)",
+        latitudes,
+        longitudes,
+        embedding.numpy(),
+    ),
+    (
+        f"stride {INFER_STRIDE} ({fine_data.num_nodes} nodes, inferred)",
+        fine_latitudes,
+        fine_longitudes,
+        fine_embedding.numpy(),
+    ),
+]
+figure, axes = plt.subplots(
+    2, 1, figsize=(12.0, 13.0), subplot_kw={"projection": ccrs.PlateCarree()}
+)
+for axis, (title, lat, lon, values) in zip(axes, panels, strict=True):
+    axis.set_global()
+    era5.draw_globe(axis, lat, lon, values, scale=scale)
+    axis.coastlines(linewidth=0.5)
+    axis.set_title(title)
+plt.show()
 """
         ),
         new_markdown_cell(

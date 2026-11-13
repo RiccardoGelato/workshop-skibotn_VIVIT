@@ -2,13 +2,15 @@
 
 ``nofe`` consumes a precomputed graph, so the ERA5 examples build theirs here. Coordinates are
 normalised Cartesian directions on a sphere of radius one, and the neighbourhood is a radius graph
-with observed rows as the only senders.
+with observed rows as the only senders. The radius is a constructor default that ``build`` may
+override per call, so one grid resolution can be trained on and a finer one embedded.
 """
 
 from __future__ import annotations
 
 import math
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +19,8 @@ from torch import Tensor
 from torch_geometric.data import Data
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from graph_utils import geometry_edge_attr, radius_edges, raster_radius_edges  # noqa: E402
 from graph_utils import merge_queries as _merge_queries  # noqa: E402
-from graph_utils import radius_edges  # noqa: E402
 
 EARTH_RADIUS = 6_371_000.0  # metres; positions are coordinates / EARTH_RADIUS
 VARIABLES = ("w", "v", "z", "q", "r", "t", "d", "o3", "pv", "u", "vo")
@@ -88,10 +90,34 @@ class Era5Graph:
         return np.stack(channels, axis=-1), latitudes[lat_rows], longitudes[lon_cols]
 
     def _radius_edges(
-        self, pos: Tensor, sources: np.ndarray, targets: np.ndarray
+        self, pos: Tensor, sources: np.ndarray, targets: np.ndarray, radius: float | None = None
     ) -> tuple[Tensor, Tensor]:
         """Radius neighbourhood with ``sources`` sending and ``targets`` receiving."""
-        return radius_edges(pos, self.radius, sources=sources, targets=targets)
+        return radius_edges(
+            pos, self.radius if radius is None else radius, sources=sources, targets=targets
+        )
+
+    def _raster_radius_edges(
+        self,
+        pos: Tensor,
+        sources: np.ndarray,
+        targets: np.ndarray,
+        *,
+        rows: int,
+        cols: int,
+        radius: float | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Full-raster radius neighbourhood, banded by latitude so a fine grid stays buildable."""
+        neighbor, query = raster_radius_edges(
+            pos,
+            self.radius if radius is None else radius,
+            rows=rows,
+            cols=cols,
+            sources=sources,
+            targets=targets,
+        )
+        edge_index = torch.stack((neighbor, query))
+        return edge_index, geometry_edge_attr(pos, edge_index)
 
     def build(
         self,
@@ -99,6 +125,7 @@ class Era5Graph:
         latitudes: np.ndarray,
         longitudes: np.ndarray,
         *,
+        radius: float | None = None,
         query_mask: np.ndarray | None = None,
         query_features: np.ndarray | None = None,
         fill: str = "interpolate",
@@ -112,10 +139,18 @@ class Era5Graph:
         rows back into its own raster. Queried locations off the raster go through
         ``merge_queries(graph.positions(lat, lon), ...)`` directly.
 
+        ``radius`` overrides the constructor's chord for this call only, so one ``Era5Graph`` can
+        serve a coarse training grid and a fine inference grid. The mask-free (fully observed) case
+        builds its edges banded by latitude, whose cost grows with the local neighbourhood rather
+        than with the square of the node count.
+
         Locations, not features, are unioned: withheld rows are placed in the graph after the
         known ones, receive their neighbours' messages and send none, keep a ``fill`` substitute in
         ``x`` and their truth in ``y``.
         """
+        radius = self.radius if radius is None else float(radius)
+        if radius <= 0:
+            raise ValueError("radius must be positive")
         pos = self.positions(latitudes, longitudes)
         flat = features.reshape(-1, features.shape[2])
         truth = None
@@ -127,8 +162,14 @@ class Era5Graph:
                 )
             truth = query_features.reshape(flat.shape)
         if query_mask is None:
-            data = _merge_queries(pos, flat, fill=fill, k=FILL, edge_builder=self._radius_edges)
-            self.report(data)
+            builder = partial(
+                self._raster_radius_edges,
+                rows=features.shape[0],
+                cols=features.shape[1],
+                radius=radius,
+            )
+            data = _merge_queries(pos, flat, fill=fill, k=FILL, edge_builder=builder)
+            self.report(data, radius=radius)
             return data
 
         flags = np.asarray(query_mask).reshape(-1).astype(bool)
@@ -147,20 +188,21 @@ class Era5Graph:
             query_ids=withheld,
             fill=fill,
             k=FILL,
-            edge_builder=self._radius_edges,
+            edge_builder=partial(self._radius_edges, radius=radius),
         )
-        self.report(data)
+        self.report(data, radius=radius)
         return data
 
-    def report(self, data: Data) -> str:
+    def report(self, data: Data, *, radius: float | None = None) -> str:
         """Print and return the neighbour statistics of ``data``."""
+        radius = self.radius if radius is None else float(radius)
         counts = torch.bincount(data.edge_index[1], minlength=data.num_nodes)
         mean = float(counts.float().mean())
         isolated = int((counts == 0).sum())
         percent = 100.0 * isolated / max(1, data.num_nodes)
-        arc = math.degrees(2.0 * math.asin(min(1.0, self.radius / 2.0)))
+        arc = math.degrees(2.0 * math.asin(min(1.0, radius / 2.0)))
         text = (
-            f"radius {self.radius:.5f} (chord on the unit sphere, {arc:.2f} deg arc), "
+            f"radius {radius:.5f} (chord on the unit sphere, {arc:.2f} deg arc), "
             f"{data.num_nodes} nodes, {data.edge_index.shape[1]} edges\n"
             f"mean neighbours per receiver: {mean:.2f}  "
             f"max: {int(counts.max()) if counts.numel() else 0}\n"
