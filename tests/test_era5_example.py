@@ -1,10 +1,19 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "era5.py"
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+ERA5 = EXAMPLES / "era5"
+SCRIPTS = ERA5 / "scripts"
+EXAMPLE = SCRIPTS / "era5.py"
+sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ERA5 / "utilities"))
+sys.path.insert(0, str(EXAMPLES))
+
+from era5_graph import VARIABLES  # noqa: E402
 
 
 def _load():
@@ -16,22 +25,12 @@ def _load():
 
 def test_example_imports_without_netcdf_or_matplotlib() -> None:
     module = _load()
-    assert module.VARIABLES[0] == "w"
-    assert len(module.VARIABLES) == 11
-
-
-def test_unit_sphere_is_unit_norm() -> None:
-    module = _load()
-    points = module.unit_sphere(np.array([30.0, 75.0]), np.array([-12.0, 0.0, 33.0]))
-    assert points.shape == (6, 3)
-    assert np.allclose(np.linalg.norm(points, axis=1), 1.0, atol=1e-6)
-
-
-def test_unit_sphere_joins_the_antimeridian() -> None:
-    module = _load()
-    # 179.75 E and 179.75 W are one grid step apart on the globe, not a hemisphere.
-    points = module.unit_sphere(np.array([0.0]), np.array([179.75, -179.75]))
-    assert np.linalg.norm(points[0] - points[1]) < np.deg2rad(1.0)
+    assert VARIABLES[0] == "w"
+    assert len(VARIABLES) == 11
+    # The graph comes from the generator; the example only asks for one.
+    assert module.TRAIN_RADIUS > 0 and module.INFER_RADIUS > 0
+    assert module.INFER_STRIDE < module.TRAIN_STRIDE
+    assert 0 < module.NYSTROM <= 1
 
 
 def test_rgba_colours_stay_in_range_and_keep_holes_transparent() -> None:

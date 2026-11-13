@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -18,6 +18,54 @@ from .nystrom import NystromSampler, node_indices
 from .runtime import get_device, set_seed, to_device, validate_graph
 
 CHECKPOINT_FORMAT = "nofe-checkpoint-2"
+
+
+def _as_graphs(data: Data | Iterable[Data]) -> list[Data]:
+    """Normalise a single graph or an iterable of them to a non-empty list.
+
+    ``Data`` is checked first on purpose: it implements ``__iter__`` (yielding ``(key, value)``
+    pairs), so an ``isinstance(..., Iterable)`` test would shred a single graph into its attribute
+    tuples.
+    """
+    if isinstance(data, Data):
+        graphs = [data]
+    elif isinstance(data, (str, bytes)) or not isinstance(data, Iterable):
+        raise TypeError(
+            f"expected torch_geometric.data.Data or an iterable of them, got {type(data).__name__}"
+        )
+    else:
+        graphs = list(data)
+    if not graphs:
+        raise ValueError("at least one graph is required")
+
+    first = graphs[0]
+    validate_graph(first)
+    for index, graph in enumerate(graphs[1:], start=1):
+        validate_graph(graph)
+        if graph.x.shape[1] != first.x.shape[1] or (
+            graph.edge_attr.shape[1] != first.edge_attr.shape[1]
+        ):
+            raise ValueError(
+                f"graph {index} has widths x={graph.x.shape[1]}, "
+                f"edge_attr={graph.edge_attr.shape[1]} but graph 0 has "
+                f"x={first.x.shape[1]}, edge_attr={first.edge_attr.shape[1]}; every graph in one "
+                "call must share both widths"
+            )
+    return graphs
+
+
+class _PreparedGraph(NamedTuple):
+    """One training graph plus the per-graph masks or Nyström sampling state."""
+
+    data: Data
+    train_mask: torch.Tensor | None = None
+    val_mask: torch.Tensor | None = None
+    inputs: np.ndarray | None = None
+    outputs: np.ndarray | None = None
+    val_queries: np.ndarray | None = None
+    val_landmarks: np.ndarray | None = None
+    sampler: NystromSampler | None = None
+    train_rng: torch.Generator | None = None
 
 
 class NOFE:
@@ -64,13 +112,13 @@ class NOFE:
 
     # -- construction -----------------------------------------------------
 
-    def build(self, data: Data) -> KernelNN:
+    def build(self, data: Data | Iterable[Data]) -> KernelNN:
         """Create (or reuse) the network for the feature width of ``data``."""
         if self._model is not None:
             return self._model
-        validate_graph(data)
-        in_channels = int(data.x.shape[1])
-        edge_channels = int(data.edge_attr.shape[1])
+        first = _as_graphs(data)[0]
+        in_channels = int(first.x.shape[1])
+        edge_channels = int(first.edge_attr.shape[1])
         self._model = KernelNN(
             in_channels,
             edge_channels,
@@ -152,11 +200,13 @@ class NOFE:
             query_mask=mask,
         )
 
-    def _split(self, data: Data) -> tuple[torch.Tensor, torch.Tensor]:
+    def _split(self, data: Data, *, seed: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Boolean train/validation masks over the scored (``output_mask``) rows."""
         num_nodes = data.num_nodes
         candidates = node_indices(data, "output_mask")
-        generator = torch.Generator().manual_seed(int(self._config["seed"]))
+        generator = torch.Generator().manual_seed(
+            int(self._config["seed"]) if seed is None else int(seed)
+        )
         order = candidates[torch.randperm(len(candidates), generator=generator).numpy()]
         n_val = max(1, round(len(candidates) * self._config["val_fraction"]))
         if n_val >= len(candidates):
@@ -183,16 +233,72 @@ class NOFE:
             weight += len(piece)
         return total / weight
 
+    def _prepare(self, graphs: list[Data]) -> list[_PreparedGraph]:
+        """Per-graph masks or Nyström state, built once with a per-graph reproducible seed."""
+        seed = int(self._config["seed"])
+        approximation = self._nystrom() is not None
+        prepared: list[_PreparedGraph] = []
+        for index, graph in enumerate(graphs):
+            graph = to_device(graph, self.device)
+            if not approximation:
+                train_mask, val_mask = self._split(graph, seed=seed + index)
+                prepared.append(_PreparedGraph(graph, train_mask, val_mask))
+                continue
+            sampler = self._sampler()
+            inputs = node_indices(graph, "input_mask")
+            outputs = self._query_candidates(graph)
+            prepared.append(
+                _PreparedGraph(
+                    graph,
+                    inputs=inputs,
+                    outputs=outputs,
+                    val_queries=outputs[: sampler.query_count(len(outputs))],
+                    val_landmarks=sampler.sample_nodes(
+                        inputs,
+                        sampler.landmark_count(len(inputs)),
+                        torch.Generator().manual_seed(seed + len(graphs) + index),
+                    ),
+                    sampler=sampler,
+                    train_rng=torch.Generator().manual_seed(seed + index),
+                )
+            )
+        return prepared
+
+    def _train_step(self, prepared: _PreparedGraph) -> torch.Tensor:
+        data = prepared.data
+        if prepared.sampler is None:
+            prediction = self.model(data.x, data.edge_index, data.edge_attr)
+            return self._graph_loss(data, prediction, prepared.train_mask)
+        landmarks = prepared.sampler.sample_nodes(
+            prepared.inputs,
+            prepared.sampler.landmark_count(len(prepared.inputs)),
+            prepared.train_rng,
+        )
+        return self._chunked_loss(data, landmarks, prepared.outputs)
+
+    def _validation_loss(self, prepared: _PreparedGraph) -> torch.Tensor:
+        data = prepared.data
+        if prepared.sampler is None:
+            prediction = self.model(data.x, data.edge_index, data.edge_attr)
+            return self._graph_loss(data, prediction, prepared.val_mask)
+        return self._chunked_loss(data, prepared.val_landmarks, prepared.val_queries)
+
     # -- training ---------------------------------------------------------
 
-    def train(self, data: Data) -> list[dict[str, float]]:
-        """Fit the operator on ``data`` and return the per-epoch history."""
-        validate_graph(data)
-        self._require_truth(data, "train")
+    def train(self, data: Data | Iterable[Data]) -> list[dict[str, float]]:
+        """Fit the operator on one graph or a list of them; return the per-epoch history.
+
+        With ``N`` graphs an epoch is ``N`` optimizer steps, one per graph, and its reported
+        ``train_loss``/``val_loss`` are the means over those graphs. ``epochs``, ``patience`` and
+        ``early_stopping`` keep counting epochs, not steps.
+        """
+        graphs = _as_graphs(data)
+        for graph in graphs:
+            self._require_truth(graph, "train")
         set_seed(int(self._config["seed"]))
         if self._model is None:
-            self.build(data)
-        data = to_device(data, self.device)
+            self.build(graphs[0])
+        prepared = self._prepare(graphs)
 
         optimizer = torch.optim.AdamW(
             self._parameters(),
@@ -203,24 +309,8 @@ class NOFE:
         early_stopping = bool(self._config["early_stopping"])
         patience = int(self._config["patience"])
         min_delta = float(self._config["min_delta"])
-
-        seed = int(self._config["seed"])
-        approximation = self._nystrom() is not None
         total_epochs = int(self._config["epochs"])
         log_every = int(self._config["log_every"])
-
-        if approximation:
-            sampler = self._sampler()
-            train_rng = torch.Generator().manual_seed(seed)
-            val_rng = torch.Generator().manual_seed(seed + 1)
-            inputs = node_indices(data, "input_mask")
-            outputs = self._query_candidates(data)
-            val_queries = outputs[: sampler.query_count(len(outputs))]
-            val_landmarks = sampler.sample_nodes(
-                inputs, sampler.landmark_count(len(inputs)), val_rng
-            )
-        else:
-            train_mask, val_mask = self._split(data)
 
         self.history = []
         best_loss = float("inf")
@@ -228,31 +318,23 @@ class NOFE:
         stale = 0
 
         for epoch in range(1, total_epochs + 1):
-            self.model.train()
-            optimizer.zero_grad()
-            if approximation:
-                landmarks = sampler.sample_nodes(
-                    inputs, sampler.landmark_count(len(inputs)), train_rng
-                )
-                loss = self._chunked_loss(data, landmarks, outputs)
-            else:
-                prediction = self.model(data.x, data.edge_index, data.edge_attr)
-                loss = self._graph_loss(data, prediction, train_mask)
-            loss.backward()
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(self._parameters(), grad_clip)
-            optimizer.step()
-            train_value = float(loss.detach())
+            train_values = []
+            for prepared_graph in prepared:
+                self.model.train()
+                optimizer.zero_grad()
+                loss = self._train_step(prepared_graph)
+                loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(self._parameters(), grad_clip)
+                optimizer.step()
+                train_values.append(float(loss.detach()))
 
             self.model.eval()
             with torch.no_grad():
-                if approximation:
-                    val_loss = self._chunked_loss(data, val_landmarks, val_queries)
-                else:
-                    val_prediction = self.model(data.x, data.edge_index, data.edge_attr)
-                    val_loss = self._graph_loss(data, val_prediction, val_mask)
-                val_value = float(val_loss)
+                val_values = [float(self._validation_loss(p)) for p in prepared]
 
+            train_value = float(np.mean(train_values))
+            val_value = float(np.mean(val_values))
             if not np.isfinite(train_value) or not np.isfinite(val_value):
                 raise FloatingPointError(
                     f"non-finite loss at epoch {epoch} (train={train_value}, val={val_value}); "
@@ -348,27 +430,38 @@ class NOFE:
             return torch.empty((0, self.dim), dtype=torch.float32)
         return torch.cat(pieces)
 
-    def loss(self, data: Data) -> float:
-        """Mean KL divergence of the trained operator on ``data``."""
-        validate_graph(data)
-        self._require_truth(data, "score")
-        self._ensure_built(data)
+    def loss(self, data: Data | Iterable[Data]) -> float:
+        """Mean KL divergence of the trained operator, averaged over graphs."""
+        graphs = _as_graphs(data)
+        for graph in graphs:
+            self._require_truth(graph, "score")
+        self._ensure_built(graphs[0])
         self.model.eval()
-        data = to_device(data, self.device)
+        values = [self._single_loss(graph) for graph in graphs]
+        return float(np.mean(values))
 
+    def _single_loss(self, data: Data) -> float:
+        """One graph's loss; the landmark draw uses ``config["seed"]`` for every graph.
+
+        The seed deliberately does not vary per graph: ``loss`` is documented as the unweighted
+        mean over graphs, so scoring ``[a, b]`` has to equal the mean of scoring each alone.
+        """
         with torch.no_grad():
+            data = to_device(data, self.device)
             if self._nystrom() is None:
                 prediction = self.model(data.x, data.edge_index, data.edge_attr)
                 mask = getattr(data, "output_mask", None)
                 if mask is not None:
                     mask = mask.to(dtype=torch.bool)
                 return float(self._graph_loss(data, prediction, mask))
-
             sampler = self._sampler()
             inputs = node_indices(data, "input_mask")
             outputs = self._query_candidates(data)
-            rng = torch.Generator().manual_seed(int(self._config["seed"]))
-            landmarks = sampler.sample_nodes(inputs, sampler.landmark_count(len(inputs)), rng)
+            landmarks = sampler.sample_nodes(
+                inputs,
+                sampler.landmark_count(len(inputs)),
+                torch.Generator().manual_seed(int(self._config["seed"])),
+            )
             queries = outputs[: sampler.query_count(len(outputs))]
             return float(self._chunked_loss(data, landmarks, queries))
 

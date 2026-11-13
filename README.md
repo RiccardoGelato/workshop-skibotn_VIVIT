@@ -45,9 +45,10 @@ are only `torch`, `torch-geometric` and `numpy`.
 
 ## Providing data
 
-`nofe` consumes a single `torch_geometric.data.Data` per call. There is no dataset class, no
-transform pipeline and no train/test file format: assemble the graph yourself, from whatever your
-data source is, and hand it over.
+`nofe` consumes graphs as `torch_geometric.data.Data`. `train`, `loss` and `build` accept one graph
+or an iterable of them; `embed` takes exactly one. There is no dataset class, no transform pipeline
+and no train/test file format: assemble each graph yourself, from whatever your data source is, and
+hand it over.
 
 ### Required fields
 
@@ -305,6 +306,34 @@ owning their features.
 `chunk_size` walks the queries in fixed-size blocks and changes peak memory only, never the result.
 It matters most here: a small chunk rebuilds the active subgraph many times per epoch.
 
+
+### Training on several graphs
+
+Pass a list (or any iterable) of graphs to `train`, `loss` or `build` when one operator has to cover
+several of them — one graph per date, per station set or per time window:
+
+```python
+model = NOFE(dim=2, config={"epochs": 150})
+history = model.train([january, august])
+score = model.loss([january, august])
+embedding = model.embed(august)  # embed stays single-graph
+```
+
+- **One optimizer step per graph per epoch.** `N` graphs make an epoch `N` steps, so `epochs`,
+  `patience` and `early_stopping` keep counting epochs rather than steps.
+- **`history["train_loss"]` and `history["val_loss"]` are means over the graphs** of that epoch.
+- **`loss` returns the unweighted mean over graphs**: each graph counts once, whatever its node
+  count.
+- **Every graph must share the `x` and `edge_attr` widths.** They are checked up front, before any
+  optimizer step, and the error names the offending graph index.
+- **`embed` takes one graph.** Loop over the list if you need every embedding: its return type would
+  otherwise be one tensor or many depending on the argument.
+
+The train/validation split and the Nyström landmark draws are seeded per graph, so a list is
+reproducible run to run.
+
+A single `Data` behaves exactly as before: one graph reduces to today's seeds and one step per epoch.
+
 ### Choosing between them
 
 | Situation | Workflow |
@@ -334,10 +363,10 @@ NOFE(dim=2, *, config=None, **overrides)
 | `.device` | `torch.device` | resolved from `config["device"]` at construction |
 | `.history` | `list[dict]` | `epoch`, `train_loss`, `val_loss`, `best_val_loss` |
 | `.best_val_loss` | `float \| None` | best validation loss seen; `None` before training |
-| `.build(data)` | `KernelNN` | infers widths from `data`; later calls reuse the weights |
-| `.train(data)` | `list[dict]` | trains in place and returns the history |
+| `.build(data \| graphs)` | `KernelNN` | infers widths from the first graph; later calls reuse the weights |
+| `.train(data \| graphs)` | `list[dict]` | trains in place; one optimizer step per graph per epoch; returns the history |
 | `.embed(data)` | CPU `torch.Tensor` | `[num_output_nodes, dim]`, rows in `output_mask` order |
-| `.loss(data)` | `float` | mean KL over the scored rows of the trained operator |
+| `.loss(data \| graphs)` | `float` | mean KL over the scored rows of the trained operator; the mean over graphs for a list |
 | `.save(path)` | `Path` | writes a `nofe-checkpoint-2` payload |
 | `NOFE.load(path, device=None)` | `NOFE` | `weights_only=True` load, model in `eval()` mode; a `nofe-checkpoint-1` file is rejected with a retrain hint |
 

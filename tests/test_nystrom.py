@@ -3,29 +3,27 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from nofe import build_graph
 from nofe.nystrom import NystromSampler, node_indices
 
 
 def _data(num_nodes: int = 60) -> Data:
-    """Masked graph whose edges come from ``build_graph``: pose/receive only, no radius."""
+    """Masked graph: observed rows 0..39 send to their 3 nearest, every row receives."""
     torch.manual_seed(0)
-    positions = torch.rand(num_nodes, 2) * 8.0
-    features = torch.rand(num_nodes, 3)
-    keep = np.arange(40)
-    observed = build_graph(
-        positions[keep],
-        features[keep],
-        query_positions=positions[40:],
-        neighbor="radius",
-        radius=3.0,
-    )
-    data = Data(x=observed.x, pos=observed.pos, edge_index=observed.edge_index)
-    data.edge_attr = observed.edge_attr
-    data.input_mask = observed.input_mask
-    output_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    output_mask[20:] = True
-    data.output_mask = output_mask
+    pos = torch.rand(num_nodes, 2) * 8.0
+    x = torch.rand(num_nodes, 3)
+    senders, receivers = [], []
+    for node in range(num_nodes):
+        if node >= 40:
+            continue
+        distance = (pos - pos[node]).norm(dim=1)
+        for peer in distance.argsort()[1:4].tolist():
+            senders.append(node)
+            receivers.append(peer)
+    edge_index = torch.tensor([senders, receivers])
+    edge_attr = torch.rand(edge_index.shape[1], 2 * pos.shape[1] + 1)
+    data = Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
+    data.input_mask = torch.arange(num_nodes) < 40
+    data.output_mask = torch.arange(num_nodes) >= 20
     return data
 
 
@@ -39,7 +37,7 @@ def test_node_indices_defaults_and_masks() -> None:
     assert np.array_equal(node_indices(unmasked, "output_mask"), np.arange(9))
 
 
-def test_active_graph_structure_inherits_the_built_neighbourhood() -> None:
+def test_active_graph_structure_inherits_the_supplied_neighbourhood() -> None:
     data = _data()
     sampler = NystromSampler(transition=0.5, chunk_size=8)
     generator = torch.Generator().manual_seed(3)
@@ -60,12 +58,9 @@ def test_active_graph_structure_inherits_the_built_neighbourhood() -> None:
     assert set(senders) <= {int(node) for node in landmarks}
 
 
-def test_active_graph_follows_the_graph_neighbourhood_not_a_radius() -> None:
-    """A kNN-built graph yields kNN edges in the subgraph: the neighbourhood is method-free."""
-    torch.manual_seed(0)
-    positions = torch.rand(60, 2) * 8.0
-    features = torch.rand(60, 3)
-    data = build_graph(positions, features, neighbor="knn", k=4)
+def test_active_graph_uses_the_supplied_edges() -> None:
+    """The subgraph keeps the caller's edges: the neighbourhood is not re-derived here."""
+    data = _data()
     data.output_mask = torch.ones(60, dtype=torch.bool)
     sampler = NystromSampler(transition=0.5, chunk_size=8)
 
@@ -139,3 +134,33 @@ def test_mask_membership_is_enforced() -> None:
         sampler.active_graph(data, np.array([0, 1]), np.array([20, 21]))
     with pytest.raises(ValueError, match="landmarks must be selected by input_mask"):
         sampler.active_graph(data, np.array([20, 21]), np.array([50, 51]))
+
+
+def test_active_graph_copies_the_supplied_edge_features() -> None:
+    """Edge features are data, not recomputed: the edge kernel was trained on these."""
+    data = _data()
+    data.edge_dist = torch.arange(data.edge_index.shape[1], dtype=torch.float32)
+    sampler = NystromSampler(transition=0.5, chunk_size=8)
+    queries = np.arange(50, 60)
+    landmarks = np.arange(0, 10)
+    active = sampler.active_graph(data, queries, landmarks)
+
+    senders = data.edge_index[0].tolist()
+    receivers = data.edge_index[1].tolist()
+    active_nodes = set(queries.tolist()) | set(landmarks.tolist())
+    kept = [
+        index
+        for index, (sender, receiver) in enumerate(zip(senders, receivers, strict=True))
+        if sender in set(landmarks.tolist()) and receiver in active_nodes
+    ]
+    assert active.edge_index.shape[1] == len(kept)
+    assert torch.equal(active.edge_attr, data.edge_attr[kept].float())
+    assert torch.equal(active.edge_dist, data.edge_dist[kept])
+
+
+def test_graph_without_edges_is_refused() -> None:
+    data = _data()
+    data.edge_index = None  # a graph without edges cannot back the Nyström path
+    sampler = NystromSampler(transition=0.5, chunk_size=8)
+    with pytest.raises(ValueError, match="needs data.edge_index"):
+        sampler.active_graph(data, np.array([20, 21]), np.array([0, 1]))

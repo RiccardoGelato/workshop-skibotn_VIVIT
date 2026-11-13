@@ -4,14 +4,20 @@ import torch
 from torch import nn
 from torch_geometric.nn import NNConv
 
-from nofe.graphs import knn_graph
 from nofe.model import EdgeConv, KernelNN
+
+
+def _ring_edges(num_nodes: int, k: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic neighbour ring: node i receives from i+1 .. i+k."""
+    rows = torch.arange(num_nodes).repeat_interleave(k)
+    cols = (rows + torch.arange(1, k + 1).repeat(num_nodes)) % num_nodes
+    edge_index = torch.stack([cols, rows])
+    return edge_index, torch.rand(edge_index.shape[1], 2 * 2 + 1)
 
 
 def _fixture():
     torch.manual_seed(0)
-    pos = torch.rand(40, 2) * 4.0
-    edge_index, edge_attr = knn_graph(pos, 5)
+    edge_index, edge_attr = _ring_edges(40, 5)
     # Node 3 loses all incoming edges: an isolated receiver must not break parity.
     keep = edge_index[1] != 3
     edge_index = edge_index[:, keep]
@@ -67,8 +73,7 @@ def test_config_round_trip_rebuilds_model() -> None:
     rebuilt.load_state_dict(model.state_dict())
 
     x = torch.rand(12, 3)
-    pos = torch.rand(12, 2) * 3.0
-    edge_index, edge_attr = knn_graph(pos, 3)
+    edge_index, edge_attr = _ring_edges(12, 3)
     edge_attr = torch.rand(edge_index.shape[1], 5)
     assert torch.equal(rebuilt(x, edge_index, edge_attr), model(x, edge_index, edge_attr))
     assert rebuilt.depth == model.depth == 2
