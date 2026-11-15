@@ -1,0 +1,106 @@
+[
+  {
+    "orientation": "inline",
+    "index": 60,
+    "shape": [
+      255,
+      901
+    ],
+    "transpose": "volume[index,:,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "stem": "inline_0060"
+  },
+  {
+    "orientation": "inline",
+    "index": 300,
+    "shape": [
+      255,
+      901
+    ],
+    "transpose": "volume[index,:,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "stem": "inline_0300"
+  },
+  {
+    "orientation": "inline",
+    "index": 540,
+    "shape": [
+      255,
+      901
+    ],
+    "transpose": "volume[index,:,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3,
+      5
+    ],
+    "stem": "inline_0540"
+  },
+  {
+    "orientation": "crossline",
+    "index": 90,
+    "shape": [
+      255,
+      601
+    ],
+    "transpose": "volume[:,index,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "stem": "crossline_0090"
+  },
+  {
+    "orientation": "crossline",
+    "index": 450,
+    "shape": [
+      255,
+      601
+    ],
+    "transpose": "volume[:,index,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "stem": "crossline_0450"
+  },
+  {
+    "orientation": "crossline",
+    "index": 810,
+    "shape": [
+      255,
+      601
+    ],
+    "transpose": "volume[:,index,:].T",
+    "class_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "stem": "crossline_0810"
+  }
+]

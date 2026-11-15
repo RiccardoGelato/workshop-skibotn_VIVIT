@@ -24,3 +24,7 @@ examples/era5/notebooks/*.pt
 
 # ERA5 inputs for the notebooks: 21 MB per date, fetched by the user (see README)
 #examples/era5/data/*.nc
+
+# Seismic benchmark volumes: 1.2 GB of .npy, shipped as a downloadable package (see
+# examples/seismic/README.md). Only the example code is tracked.
+examples/seismic/data/**/*.npy

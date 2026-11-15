@@ -1,0 +1,45 @@
+{
+  "normalized_amplitude": {
+    "min": -4.771994113922119,
+    "max": 4.762462615966797,
+    "mean": 0.0036922859133755523,
+    "std": 1.005827922479861,
+    "nonfinite": 0,
+    "zero_voxels": 0,
+    "voxels": 138082755,
+    "all_zero_traces": 0,
+    "all_zero_planes": [
+      [],
+      [],
+      []
+    ]
+  },
+  "labels": {
+    "counts": [
+      34940426,
+      15112086,
+      68326029,
+      8651372,
+      8535595,
+      2517247
+    ],
+    "fractions": [
+      0.25303975141573615,
+      0.10944223990895895,
+      0.4948194218749474,
+      0.06265352976191704,
+      0.06181506879696889,
+      0.01822998824147157
+    ],
+    "invalid_voxels": 0,
+    "coverage": 1.0,
+    "slices_with_invalid": [
+      [],
+      [],
+      []
+    ]
+  },
+  "checked_exported_pairs": 6,
+  "normalization_matches": true,
+  "slice_crossings_match": true
+}

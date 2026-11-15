@@ -1,0 +1,14 @@
+{
+  "Parihaka_data.zip": {
+    "bytes": 449881742,
+    "sha256": "6928a0aed076a8289475274914f685502e0c0e50fc8356076441e7440fee5e7c"
+  },
+  "data.zip": {
+    "bytes": 1051449986,
+    "sha256": "bc26b49fff91a5c236f90f78263e56cc6e495cf53d6c2b87c42cc50c3ec4881c"
+  },
+  "raw.zip": {
+    "bytes": 1084578002,
+    "sha256": "db55efab6bfc3c64901ed2515557a95bf5fe74e34773521b7afc6d1319bc6f30"
+  }
+}
