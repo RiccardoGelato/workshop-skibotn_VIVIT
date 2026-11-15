@@ -31,9 +31,15 @@ notebooks = [
     "scipy>=1.13",
 ]
 
-[dependency-groups]
-# The tests build graphs with the example helpers, so they need scipy and faiss-cpu too.
-dev = ["pytest>=8", "ruff>=0.9", "scipy>=1.13", "faiss-cpu>=1.11,<1.16"]
+# The tests build graphs with the example helpers, so they need scipy and faiss-cpu too. `marimo`
+# runs `examples/seismic/notebooks/clusters.py`, the interactive version of the clustering sweep.
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+    "scipy>=1.13",
+    "faiss-cpu>=1.11,<1.16",
+    "marimo>=0.25.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]

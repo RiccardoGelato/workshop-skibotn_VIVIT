@@ -35,6 +35,9 @@ NYSTROM = 0.25
 PERCENTILE = 5
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "f3_embedding.png"
+# The embedding, saved for the clustering notebook (`notebooks/clusters.py`): training takes ~10
+# minutes and the notebook only needs the result.
+CACHE = Path(__file__).resolve().parents[1] / "f3_embedding.npz"
 # width=8, ker_width=32 are the reference NOFE settings; the message tensor is [edges, width], so
 # width drives peak memory. chunk_size is the Nyström query chunk: 262144 keeps the 541,501 queries
 # to three passes per step, which is what makes a full-cube epoch affordable on CPU.
@@ -194,7 +197,20 @@ def run(cube: F3Cube, epochs: int):
     print(f"finished in {time.time() - started:.0f} s")
 
     rows_km, cols_km = raster_coordinates(rows, cols)
+    save_cache(rows_km, cols_km, embedding)
     return rows_km, cols_km, embedding, model, history, mean_kl
+
+
+def save_cache(rows_km: np.ndarray, cols_km: np.ndarray, embedding: np.ndarray) -> Path:
+    """Write the embedding beside the plot so the clustering notebook need not retrain.
+
+    ``np.savez`` keeps this to one small file (4.3 MB for 541,501 x 3) and the notebook loads it
+    with ``np.load``: no dependency on this script's module path, no re-run of a 10-minute training.
+    """
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(CACHE, rows_km=rows_km, cols_km=cols_km, embedding=embedding)
+    print(f"wrote {CACHE} ({CACHE.stat().st_size / 1e6:.1f} MB)")
+    return CACHE
 
 
 def main() -> None:

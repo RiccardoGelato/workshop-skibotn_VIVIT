@@ -49,5 +49,22 @@ uv run python examples/seismic/scripts/seismic.py --stride 2 --epochs 10   # qui
 `--radius-km` sets the lateral support, `--epochs` the training budget. The graph, the model and the
 embedding all cover the whole cube at `--stride 1`.
 
-Outputs `examples/seismic/f3_embedding.png`: one RGB colour per trace, R/G/B the three embedding
-dimensions, one `pcolormesh` cell per 25 m bin.
+Outputs two files beside the script:
+
+- `f3_embedding.png`: one RGB colour per trace, R/G/B the three embedding dimensions, one
+  `pcolormesh` cell per 25 m bin;
+- `f3_embedding.npz`: the embedding plus its raster axes, for the clustering notebook.
+
+## Cluster the embedding
+
+`notebooks/cluster-maps.py` is a [marimo](https://marimo.io) notebook that k-means the embedding at
+several `k` and draws each labelling back onto the survey:
+
+```bash
+uv run marimo edit examples/seismic/notebooks/cluster-maps.py
+```
+
+It reads the cache above, so it never retrains (~10 s). `k`, the k-means seed and the number of
+points used to fit centres are interactive; every fit is deterministic in the seed, so comparing
+`k` against `k` is fair. `utilities/clusters.py` holds k-means, the sweep and the palette, so the
+notebook and any script share one implementation.
