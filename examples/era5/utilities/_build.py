@@ -43,14 +43,12 @@ if REPO is None:
 ERA5 = REPO / "examples" / "era5"
 DATA = ERA5 / "data"
 
-# The example data is not in Git (21 MB per date), so fail with the fetch command rather than the
-# opaque `StopIteration`/`FileNotFoundError` the loader would otherwise raise.
+# Both dates ship in Git beside this notebook, so a missing file means a partial checkout; name the
+# path the loader would otherwise fail on opaquely.
 if not (DATA / "2018-01-01.nc").exists():
     raise FileNotFoundError(
         f"missing {DATA / '2018-01-01.nc'}\\n"
-        "The ERA5 inputs are not committed. Fetch them once with:\\n"
-        f"  mkdir -p {DATA}\\n"
-        f"  cp /Volumes/T7-storage/ERA5/data/2018-01-0{{1,2}}.nc {DATA}/"
+        f"The ERA5 inputs are tracked in {DATA}; restore them with `git checkout -- {DATA}`."
     )
 
 # The notebooks import the ERA5 helpers straight from the example scripts, so the loader, the

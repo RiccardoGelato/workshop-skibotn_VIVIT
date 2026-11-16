@@ -207,6 +207,12 @@ picker step. It is a per-workspace override: if the status bar shows another int
 `PointGraph` subclass in its `utilities/` directory and its notebooks. The examples need the
 `examples` extra, which pulls `cartopy`, `matplotlib`, `scipy` and `netCDF4`.
 
+The two ERA5 dates the demo and its notebooks use (`2018-01-01`, `2019-08-01`) are tracked in
+`examples/era5/data/`, 21 MB each, and that directory is the default data path, so the ERA5 pipeline
+runs from a fresh clone with no download step. `--data` (env `NOFE_ERA5_DATA`) points it at a
+different directory. The 1.2 GB F3 volume is not tracked; `examples/seismic/README.md` says where to
+put it.
+
 - The `examples` extra pins `netCDF4<1.7.5`: 1.7.5+ publishes only macOS 15 wheels, so macOS 14
   cannot install it. Its `cartopy` dependency downloads Natural Earth shapefiles on first use into
   `~/.local/share/cartopy`.

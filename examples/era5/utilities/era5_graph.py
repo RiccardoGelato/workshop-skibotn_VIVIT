@@ -26,7 +26,8 @@ from graph_utils import radius_edges, raster_radius_edges  # noqa: E402
 
 EARTH_RADIUS = 6_371_000.0  # metres; positions are coordinates / EARTH_RADIUS
 VARIABLES = ("w", "v", "z", "q", "r", "t", "d", "o3", "pv", "u", "vo")
-DEFAULT_DATA_DIR = "/Volumes/T7-storage/ERA5/data"
+# The two dates the examples and notebooks use, tracked in Git beside this file.
+DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 
 class Era5Graph(PointGraph):
@@ -67,8 +68,8 @@ class Era5Graph(PointGraph):
         path = self.data_dir / f"{date}.nc"
         if not path.exists():
             raise SystemExit(
-                f"no ERA5 file at {path}; set NOFE_ERA5_DATA to the directory that holds "
-                f"<date>.nc (default {DEFAULT_DATA_DIR}) or pass --data"
+                f"no ERA5 file at {path}; the examples ship 2018-01-01 and 2019-08-01 in "
+                f"{DEFAULT_DATA_DIR}. Pass --data (env NOFE_ERA5_DATA) for another directory."
             )
         stride = self.stride
         dataset = netCDF4.Dataset(path)

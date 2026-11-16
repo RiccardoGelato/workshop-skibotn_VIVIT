@@ -22,7 +22,8 @@ examples/*.png
 # Notebook execution artefacts
 examples/era5/notebooks/*.pt
 
-# ERA5 inputs for the notebooks: 21 MB per date, fetched by the user (see README)
+# ERA5 inputs for the notebooks: both dates (2018-01-01, 2019-08-01) are tracked, 21 MB each, so
+# the examples run from a fresh clone. The rule below is what would exclude them; keep it disabled.
 #examples/era5/data/*.nc
 
 # Seismic benchmark volumes: 1.2 GB of .npy, shipped as a downloadable package (see
