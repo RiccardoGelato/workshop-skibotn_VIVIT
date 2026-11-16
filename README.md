@@ -175,6 +175,42 @@ The edge features are `[2P + 1]`-wide for `P` location dimensions. `build` retur
 | `edge_dist` | `[E]` float32 | length of each edge in the scaled space |
 | `affinity` | `[E]` float32 | the loss target: student-t weights of `x` per edge |
 
+### What the finished graph looks like
+
+One call to `build(features, locations)` gives a `Data` where every node is one of your rows, and
+every directed edge is a "receiver sees sender" relation. Concretely, for `N` rows, `F` features, `P`
+location dimensions and a neighbourhood that produced `E` edges:
+
+```text
+features [N, F]  locations [N, P]
+        |                  |
+        |   z-score both per column over all N rows   (normalize=True)
+        |                  |
+        |       keep N or sample=N rows               (seed, ascending order)
+        v                  v
+   x [N, F]  -------->  radius / k-NN search over pos [N, P]
+        |                  |
+        |                  +--> edge_index [2, E]      sender, receiver (excluding self)
+        |                  +--> edge_dist  [E]         |pos[sender] - pos[receiver]|
+        |                  +--> edge_attr  [E, 2P+1]   [pos[receiver], direction, relative dist]
+        |                  +--> pos_raw    [N, P]      your locations, unscaled
+        v
+   affinity [E]  = student-t weights of x[sender] vs x[receiver], normalised per receiver
+```
+
+Minimum shape rules, all enforced or produced by `build`:
+
+- `features.shape[0] == locations.shape[0] == N`; both 2-D. No self loops in `edge_index`.
+- `edge_index[0]` are senders, `edge_index[1]` receivers, sorted by `(receiver, sender)` so the same
+  input always yields the same order.
+- `edge_attr` width is `2P + 1`: the receiver's `P` coordinates, `P` components of the unit
+  direction toward it, and one relative distance. So 2-D locations give 5 columns, 3-D give 7.
+- `affinity` has one entry per edge and sums to `1` over each receiver's incoming edges.
+
+A node with no incoming edge gets no affinity entry and is excluded from the loss, but still appears
+in `x` and `pos` and is still embedded (through the root weight). Check
+`torch.bincount(data.edge_index[1], minlength=data.num_nodes) == 0` if that matters.
+
 ### Normalization
 
 `normalize=True` (the default) z-scores **features and locations per column over all supplied
@@ -194,26 +230,82 @@ ascending row order, so the graph is reproducible and `edge_index` stays compara
 Sampling bounds build time and memory on large point sets: a 541,501-point graph costs a nearest-
 neighbour search over everything, which is exactly the step a subsample shrinks.
 
-## API
+## The model
+
+`KernelNN` is the operator: it takes the graph's `x` and edge features and returns one vector per
+node. Its job is to learn a map whose *local* structure reproduces the graph's affinities, so the
+only thing it needs from the graph is `x`, `edge_index` and `edge_attr`.
 
 ```python
 KernelNN(out_dim=3, *, in_channels=None, edge_channels=None, width=32, ker_width=64, depth=3,
          edge_batch_size=65_536)
 ```
 
-The `nn.Module` operator: a lift, `depth` graph-kernel convolutions and a projection. `in_channels`
-(node features) and `edge_channels` (edge features) may be omitted — they are discovered on the
-first forward pass and readable afterwards as `net.in_channels` / `net.edge_channels`, which raise
-`RuntimeError` until then. Self terms are implicit, so a node needs no self loop, and a node with no
-incoming edge is still embedded from its own features through the root weight.
+### What one forward pass does
+
+```text
+x [N, F]                    edge_attr [E, D]
+   |                             |
+   | lift: Linear F -> width     | kernel MLP: D -> ker_width -> ker_width -> width^2
+   v                             v    (one flattened width x width matrix per edge)
+h [N, width]  ---- depth x ---> EdgeConv: h_i' = W_root h_i + mean_{j -> i} M(edge_attr_ji) h_j
+   |                                  then ReLU
+   | project: Linear width -> out_dim
+   v
+z [N, out_dim]
+```
+
+Aggregation is `mean` with a root weight, so a node needs no self loop and a node with no incoming
+edge is still embedded from its own features. `depth` convolutions are applied **repeatedly to the
+same `EdgeConv` module**, i.e. the weights are shared across the `depth` steps — it is a recurrence,
+not a stack. That is why `depth` costs no parameters and why a bigger `depth` widens the receptive
+field (each layer propagates one hop) at the cost of compute only.
+
+### Parameters
+
+| Parameter | Default | What it does | Cost / effect |
+|---|---|---|---|
+| `out_dim` | `3` | embedding width; equals 3 for RGB plotting | the loss compares `out_dim`-D affinities |
+| `in_channels` | `None` | node-feature width `F` | omitted → `LazyLinear` takes it from `x` on the first forward |
+| `edge_channels` | `None` | edge-feature width `D`, which is `2P + 1` from the graph | omitted → taken from `edge_attr` |
+| `width` | `32` | hidden width of `h` | the dominant cost: kernel output and message tensors are `[E, width²]` and `[E, width]` |
+| `ker_width` | `64` | hidden width of the edge-kernel MLP | cheap; controls how non-linear the edge → matrix map is |
+| `depth` | `3` | how many message-passing hops | **no extra parameters** (shared module); `3` sees 3 hops away |
+| `edge_batch_size` | `65_536` | edges evaluated per kernel chunk | memory only — the output is bit-identical at any value, `None` disables chunking |
+
+`width` is the one to watch. The kernel MLP emits one `width × width` matrix per edge, so peak
+intermediate memory grows as `E · width²` — **in float32**, so a million edges costs 4.1 GB per chunk
+at `width=32` but 0.26 GB at `width=8`. That is why the reference examples use `width=8,
+ker_width=32`. For scale, the whole operator is 72,771 parameters at the defaults with `F=11, D=7`,
+and 3,619 at `width=8, ker_width=32`.
+
+`in_channels`/`edge_channels` resolve on the first forward pass and are readable afterwards as
+`net.in_channels` / `net.edge_channels`; both raise `RuntimeError` until then. Pass them explicitly
+to make the widths part of the constructor, which is what a checkpoint reload needs.
+
+Because the graph carries the target, nothing here consumes `pos` or `affinity` — the operator sees
+only features and edges. That is what lets one trained `KernelNN` embed a graph it never trained on,
+as long as `F` and `D` match.
+
+## The trainer
+
+`NOFE` owns a `KernelNN`, runs the optimisation loop, and hands back embeddings. It takes every
+`KernelNN` argument unchanged, plus four of its own:
 
 ```python
 NOFE(out_dim=3, *, in_channels=None, edge_channels=None, width=32, ker_width=64, depth=3,
-     edge_batch_size=65_536, nystrom=None, chunk_size=8192, device="auto")
+     edge_batch_size=65_536, nystrom=None, chunk_size=8192, device="auto", seed=42)
 ```
 
-The trainer. It holds the network as `.net` and is not itself an `nn.Module` — `nn.Module` owns the
-attribute `training` (a bool), so a driver method with that name has to live elsewhere.
+| Trainer parameter | Default | What it does |
+|---|---|---|
+| `nystrom` | `None` | `None` = dense operator over the whole graph; a fraction in `(0, 1]` = landmark approximation (see [below](#nyström-large-graphs)) |
+| `chunk_size` | `8192` | how many query rows are walked per pass on the Nyström path; memory, not result |
+| `device` | `"auto"` | `"auto"` prefers CUDA, then MPS, then CPU |
+| `seed` | `42` | seeds python/numpy/torch **before the weights are drawn**, so two trainers with the same seed start identically |
+
+It holds the network as `.net` and is not itself an `nn.Module` — `nn.Module` owns the attribute
+`training` (a bool), so a driver method with that name has to live elsewhere.
 
 | Member | Returns | Notes |
 |---|---|---|
@@ -226,8 +318,27 @@ attribute `training` (a bool), so a driver method with that name has to live els
 
 Each of them accepts a single `Data` or an iterable of them and returns the matching type:
 one history versus one history per graph, one tensor versus a list, a float versus a list of floats.
-`training` takes `epochs=200, lr=1e-2, weight_decay=5e-4, grad_clip=1.0, patience=20, min_delta=1e-6,
-val_fraction=0.1, early_stopping=True, verbose=False, log_every=1000, seed=42`.
+
+### `training()` hyperparameters
+
+All of these are per-call keywords; nothing is fixed at construction.
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `epochs` | `200` | upper bound on epochs; with early stopping on, a run may stop sooner |
+| `lr` | `1e-2` | AdamW learning rate |
+| `weight_decay` | `5e-4` | AdamW weight decay |
+| `grad_clip` | `1.0` | gradient-norm clip; `None` disables it |
+| `patience` | `20` | stop after this many epochs with no validation improvement |
+| `min_delta` | `1e-6` | how much a validation loss must improve to count |
+| `val_fraction` | `0.1` | share of nodes held out for validation each epoch |
+| `early_stopping` | `True` | `False` runs every epoch, but the best epoch's weights are still restored |
+| `verbose` | `False` | print a line per `log_every` epochs (and on the last or stopping epoch) |
+| `log_every` | `1000` | print interval when `verbose` |
+| `seed` | `42` | seeds the run; also fixes the validation split and landmark draws |
+
+`val_fraction` only decides which nodes count toward the reported validation loss — it never hides
+edges, so gradients still flow through the entire graph on every step.
 
 With `N` graphs an epoch is `N` optimizer steps, one per graph; the reported `train_loss` and
 `val_loss` are the means over graphs, and early stopping restores the weights of the best epoch on
