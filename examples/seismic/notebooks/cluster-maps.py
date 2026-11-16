@@ -6,27 +6,25 @@ app = marimo.App(width="full")
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        # k-means over the F3 embedding
+    mo.md("""
+    # k-means over the F3 embedding
 
-        The embedding from `examples/seismic/scripts/seismic.py` maps each seismic trace to three
-        numbers. Here those numbers are clustered at several `k`, and each labelling is drawn back
-        onto the survey: one colour per cluster, one cell per 25 m bin.
+    The embedding from `examples/seismic/scripts/seismic.py` maps each seismic trace to three
+    numbers. Here those numbers are clustered at several `k`, and each labelling is drawn back
+    onto the survey: one colour per cluster, one cell per 25 m bin.
 
-        Clusters of the *embedding* group traces whose lateral neighbourhoods look alike, so
-        coherent colour patches are geology the operator considers similar — salt bodies, the
-        channel system, fault blocks — not noise, because neighbouring traces feed each other's
-        embedding.
+    Clusters of the *embedding* group traces whose lateral neighbourhoods look alike, so
+    coherent colour patches are geology the operator considers similar — salt bodies, the
+    channel system, fault blocks — not noise, because neighbouring traces feed each other's
+    embedding.
 
-        The cache is written by the training script, so nothing here retrains:
+    The cache is written by the training script, so nothing here retrains:
 
-        ```bash
-        uv run python examples/seismic/scripts/seismic.py    # writes f3_embedding.npz
-        uv run marimo edit examples/seismic/notebooks/clusters.py
-        ```
-        """
-    )
+    ```bash
+    uv run python examples/seismic/scripts/seismic.py    # writes f3_embedding.npz
+    uv run marimo edit examples/seismic/notebooks/clusters.py
+    ```
+    """)
     return
 
 
@@ -57,7 +55,7 @@ def _():
     from clusters import cluster_colours, kmeans, sweep  # noqa: E402
     from f3_graph import BIN_KM  # noqa: E402
 
-    return BIN_KM, CACHE, cluster_colours, kmeans, matplotlib, mo, np, plt, sweep
+    return CACHE, cluster_colours, kmeans, mo, np, plt, sweep
 
 
 @app.cell
@@ -135,10 +133,11 @@ def _(mo, np, plt, results):
             fontsize=9,
         )
     mo.as_html(_figure)
+    return
 
 
 @app.cell
-def _(BIN_KM, cluster_colours, mo, np, plt, results, rows_km, cols_km):
+def _(cluster_colours, cols_km, mo, np, plt, results, rows_km):
 
     _ks = sorted(results)
     _columns = min(3, len(_ks))
@@ -172,6 +171,7 @@ def _(BIN_KM, cluster_colours, mo, np, plt, results, rows_km, cols_km):
         _axis.set_visible(False)
     _figure.suptitle("k-means clusters of the NOFE embedding, one colour per cluster")
     mo.as_html(_figure)
+    return
 
 
 @app.cell
@@ -190,7 +190,7 @@ def _(mo, np, results):
 
 
 @app.cell
-def _(cols_km, mo, np, results, rows_km):
+def _(cols_km, mo, results, rows_km):
     """How much a cluster map is *spatially* coherent, which the spread alone does not say.
 
     Chance agreement between two neighbouring traces is ``1/k``; anything above that is structure
