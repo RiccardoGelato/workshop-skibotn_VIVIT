@@ -24,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from nofe import NOFE
+from nofe import NOFE, describe
 from nofe.affinity import affinity_kl_loss
+from nofe.search import NearestIndex
 
 # Resolve paths from the repository layout, not the process cwd: VS Code always starts kernels in
 # the workspace folder (`jupyter.notebookFileRoot` is ignored since 2024.4), while `_execute.py`
@@ -76,13 +77,13 @@ def pca_baseline(data, dims: int = 3) -> torch.Tensor:
 
 
 def neighbour_sets(points: torch.Tensor, k: int = 10) -> np.ndarray:
-    \"\"\"Exact ``k``-nearest-neighbour ids per row, self excluded.\"\"\"
-    import faiss
-
-    values = np.ascontiguousarray(points.detach().cpu().numpy(), dtype=np.float32)
-    index = faiss.IndexFlatL2(values.shape[1])
-    index.add(values)
-    return index.search(values, k + 1)[1][:, 1:]
+    \"\"\"Exact ``k``-nearest-neighbour ids per row, self excluded, on the active backend.\"\"\"
+    values = points.detach().cpu().numpy().astype(np.float32)
+    rows = np.arange(values.shape[0])
+    sender, receiver = NearestIndex(values, rows).nearest(rows, k)
+    # ``nearest`` returns pairs sorted by receiver, so each receiver's block is already
+    # nearest-first and ``reshape`` places it on that row.
+    return sender.reshape(values.shape[0], k)
 
 
 def knn_agreement(reference: torch.Tensor, candidate: torch.Tensor, k: int = 10) -> float:

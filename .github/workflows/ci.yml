@@ -16,12 +16,28 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      # The plain sync is the supported out-of-the-box state: faiss on Linux/Windows, cKDTree on
+      # macOS with faiss never installed. No repair step is needed for this to pass.
       - run: uv sync --locked --python ${{ matrix.python }} --all-groups
-      # macOS loads faiss's vendored libomp next to torch's; the script symlinks one at the other
-      # and is a no-op elsewhere, so it runs unconditionally. It must precede pytest.
-      - run: uv run python tools/repair_faiss_omp.py
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run pytest
+
+  # The opt-in macOS path from the README: install faiss, repair the OpenMP clash, then check that
+  # cKDTree still builds identical graphs. This is what keeps the two backends honest.
+  macos-faiss:
+    runs-on: macos-14
+    env:
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --python 3.11 --all-groups --extra faiss
+      - run: uv run python tools/repair_faiss_omp.py
+      - run: uv run pytest tests/test_graph_utils.py
+      - run: NOFE_BACKEND=faiss uv run pytest tests/test_point_graph.py tests/test_operator.py
 
   latest-python:
     runs-on: ubuntu-latest

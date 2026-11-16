@@ -39,18 +39,58 @@ uv add nofe        # or: pip install nofe
 
 `torch` is pinned as `torch>=2.6,<3`; the CUDA variant is selected by `UV_TORCH_BACKEND` at install
 time and the shipped `uv.lock` is backend-independent. Requires Python ≥ 3.11. Runtime dependencies
-are `torch`, `torch-geometric`, `numpy` and `faiss-cpu` — the last one because the neighbourhood
-search is part of the package, not of the examples.
+are `torch`, `torch-geometric`, `numpy`, `scipy`, and `faiss-cpu` everywhere except macOS — see
+[Neighbour backend](#neighbour-backend).
+
+## Neighbour backend
+
+The neighbourhood search runs on one of two exact backends, chosen at runtime:
+
+| Platform | Default | Why |
+|---|---|---|
+| macOS | `scipy.spatial.cKDTree` | works out of the box |
+| Linux, Windows | `faiss` | faster index |
+
+faiss is not installed on macOS by default, because its wheel vendors its own `libomp.dylib` and
+dyld aborts on the second OpenMP initialisation next to torch's (`OMP: Error #15`). That abort
+happens at **import** time, so a fallback inside the import could never run — the platform is
+inspected first and faiss is simply never imported. A plain `uv sync` on macOS therefore needs no
+repair step, and `nofe` never touches faiss there.
+
+Both backends return **byte-identical edge sets** for the same input: radius queries are compared as
+squared float32 distances with `<` (a point at exactly `radius` is excluded, as faiss does), and
+nearest-neighbour ties resolve by sender id rather than by whichever order the library happened to
+emit. `tests/test_graph_utils.py` cross-checks them on random points, a raster band, and a lattice
+full of exact ties.
+
+### Using faiss on macOS
+
+Optional, and only a speed choice — the graphs are the same either way.
+
+```bash
+uv sync --extra faiss          # installs faiss-cpu alongside the project
+uv run python tools/repair_faiss_omp.py   # link faiss's libomp at torch's (idempotent)
+NOFE_BACKEND=faiss uv run python examples/era5/scripts/era5.py
+```
+
+`tools/repair_faiss_omp.py` replaces `faiss/.dylibs/libomp.dylib` with a symlink to
+`torch/lib/libomp.dylib`, so one OpenMP runtime is loaded instead of two. It locates both through
+`importlib.util.find_spec` and never imports faiss, so it is safe to run before the repair has
+anything to fix. It is a no-op off macOS and is idempotent.
+
+`auto` still picks cKDTree on macOS after the repair, because it cannot know the repair was applied.
+Select faiss explicitly with `NOFE_BACKEND=faiss` or `backend("faiss")`; both raise if faiss is
+missing rather than silently falling back.
 
 ## Providing data
 
 `PointGraph` is the single entry point: one node per feature row, at that row's location.
 
 ```python
-import faiss
 import numpy as np
 
 from nofe import PointGraph
+from nofe.search import RadiusIndex, sorted_pairs
 
 
 class RadiusGraph(PointGraph):
@@ -63,23 +103,20 @@ class RadiusGraph(PointGraph):
 
     def neighbour_pairs(self, points, radius, k):
         """(sender, receiver) ids: each row receives from every row within ``radius``."""
-        index = faiss.IndexFlatL2(points.shape[1])
-        index.add(np.ascontiguousarray(points, dtype=np.float32))
-        # IndexFlatL2 reports squared distances, so the search radius is squared.
-        limits, _, found = index.range_search(points, float(radius) ** 2)
-        receiver = np.repeat(
-            np.arange(points.shape[0], dtype=np.int64), np.diff(limits.astype(np.int64))
-        )
-        keep = found.astype(np.int64) != receiver
-        return found.astype(np.int64)[keep], receiver[keep]
+        rows = np.arange(points.shape[0])
+        sender, receiver = RadiusIndex(points, rows).within(rows, radius)
+        return sorted_pairs(sender, receiver)
 
 
 graph = RadiusGraph(radius=0.5).build(features, locations)
 ```
 
+`RadiusIndex`/`NearestIndex` (in `nofe.search`) are the backend-neutral searches: they pick faiss or
+cKDTree for you and return the same pairs on both. `examples/graph_utils.py` wraps them as
+`radius_edges`/`knn_edges`, which is what the two example subclasses call.
+
 `features` and `locations` are any array-likes with one row per point — the same number of rows,
-`locations` in any dimension. `examples/graph_utils.py` holds the general searches
-(`radius_edges`, `knn_edges`) and `examples/` holds two full subclasses to copy from.
+`locations` in any dimension. `examples/` holds two full subclasses to copy from.
 
 The edge features are `[2P + 1]`-wide for `P` location dimensions. `build` returns a
 `torch_geometric.data.Data` with:
@@ -180,7 +217,9 @@ kernels and landmark sub-sampling is no longer faithful to the full-graph operat
 ## Platform notes
 
 - Intel macOS is unsupported: no `torch` wheel ships for `macosx_*_x86_64` at any version ≥ 2.6.
-- macOS arm64 requires macOS ≥ 14, because torch 2.15 publishes `macosx_14_0_arm64` wheels.
+- macOS arm64 requires macOS ≥ 14, because torch 2.15 publishes `macosx_14_0_arm64` wheels. The
+  neighbourhood backend there is `scipy.spatial.cKDTree`; faiss is an opt-in speed choice, see
+  [Neighbour backend](#neighbour-backend).
 - CPU/CUDA choice happens at install time (`UV_TORCH_BACKEND`), device choice at runtime
   (`NOFE(..., device=...)`). `"auto"` prefers CUDA, then MPS, then CPU.
 - The caller's `Data` is cloned before it moves to the accelerator, so `data.x.numpy()` keeps
@@ -205,7 +244,7 @@ picker step. It is a per-workspace override: if the status bar shows another int
 
 `examples/` holds worked pipelines — the ERA5 demo and the F3 seismic cube, each with a
 `PointGraph` subclass in its `utilities/` directory and its notebooks. The examples need the
-`examples` extra, which pulls `cartopy`, `matplotlib`, `scipy` and `netCDF4`.
+`examples` extra, which pulls `cartopy`, `matplotlib` and `netCDF4`.
 
 The two ERA5 dates the demo and its notebooks use (`2018-01-01`, `2019-08-01`) are tracked in
 `examples/era5/data/`, 21 MB each, and that directory is the default data path, so the ERA5 pipeline
@@ -217,7 +256,6 @@ put it.
   cannot install it. Its `cartopy` dependency downloads Natural Earth shapefiles on first use into
   `~/.local/share/cartopy`.
 - `faiss-cpu` is capped below 1.16: 1.16.0 publishes only a `macosx_15_0_arm64` wheel and no sdist,
-  while torch 2.15 supports macOS 14.
-- On macOS the `faiss-cpu` wheel vendors its own `libomp.dylib` and torch ships another; dyld loads
-  both and the second initialisation aborts with `OMP: Error #15`. Run the repair after every
-  `uv sync` (idempotent, a no-op off macOS): `uv run python tools/repair_faiss_omp.py`.
+  while torch 2.15 supports macOS 14. It is not installed on macOS by default; see
+  [Neighbour backend](#neighbour-backend) to opt in, and run
+  `uv run python tools/repair_faiss_omp.py` after installing it there.

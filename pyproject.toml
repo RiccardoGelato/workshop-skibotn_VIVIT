@@ -8,19 +8,29 @@ dependencies = [
     "numpy>=2.0",
     "torch>=2.6,<3",
     "torch-geometric>=2.6",
-    # faiss-cpu is capped below 1.16: that is the last series publishing a `macosx_14_0_arm64` wheel
-    # (1.16.0 jumps to `macosx_15_0_arm64` and ships no sdist), and torch 2.15 supports macOS 14.
-    # It is a runtime dependency because a `PointGraph` subclass's `neighbour_pairs` is a nearest-
-    # neighbour search, and the reference implementations here use its exact L2 index.
-    "faiss-cpu>=1.11,<1.16",
+    # The cKDTree backend: it is what macOS uses, so it is a runtime dependency everywhere rather
+    # than an extra. Without it neither neighbourhood backend would exist.
+    "scipy>=1.13",
+    # faiss is the fast backend and the default off macOS. It is deliberately NOT installed on
+    # macOS: the wheel vendors its own libomp.dylib and aborts at import next to torch's
+    # (`OMP: Error #15`), so a plain `uv sync` there would need a repair step before anything ran.
+    # macOS gets cKDTree out of the box; to switch to faiss, install it and run
+    # tools/repair_faiss_omp.py (see README, "Neighbour backend").
+    #
+    # Capped below 1.16: that is the last series publishing a `macosx_14_0_arm64` wheel (1.16.0
+    # jumps to `macosx_15_0_arm64` and ships no sdist), and torch 2.15 supports macOS 14.
+    "faiss-cpu>=1.11,<1.16; sys_platform != 'darwin'",
 ]
 
 [project.optional-dependencies]
+# Opt in on macOS after repairing the OpenMP clash: `uv pip install faiss-cpu` or this extra.
+faiss = [
+    "faiss-cpu>=1.11,<1.16",
+]
 examples = [
     "cartopy>=0.24",
     "matplotlib>=3.9",
     "netCDF4>=1.7.4,<1.7.5",
-    "scipy>=1.13",
 ]
 notebooks = [
     "cartopy>=0.24",
@@ -29,15 +39,15 @@ notebooks = [
     "nbclient>=0.10",
     "nbformat>=5.10",
     "netCDF4>=1.7.4,<1.7.5",
-    "scipy>=1.13",
 ]
 
-# `marimo` runs `examples/seismic/notebooks/clusters.py`, the interactive version of the clustering
-# sweep.
+# A dependency group, not an extra, so `uv sync --all-groups` — what the README and CI run —
+# actually installs the test and lint tools. `marimo` runs
+# `examples/seismic/notebooks/clusters.py`, the interactive version of the clustering sweep.
+[dependency-groups]
 dev = [
     "pytest>=8",
     "ruff>=0.9",
-    "scipy>=1.13",
     "marimo>=0.25.2",
 ]
 

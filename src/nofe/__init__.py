@@ -3,6 +3,7 @@
 __version__ = "0.1.0"
 
 from .affinity import affinities, affinity_kl_loss
+from .backend import backend, describe
 from .graph import PointGraph
 from .model import NOFE, EdgeConv, KernelNN
 from .runtime import get_device, set_seed
@@ -14,6 +15,8 @@ __all__ = [
     "PointGraph",
     "affinities",
     "affinity_kl_loss",
+    "backend",
+    "describe",
     "get_device",
     "set_seed",
 ]

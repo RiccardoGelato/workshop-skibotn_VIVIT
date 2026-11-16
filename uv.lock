@@ -2131,27 +2131,23 @@ name = "nofe"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "faiss-cpu" },
+    { name = "faiss-cpu", marker = "sys_platform != 'darwin'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
     { name = "torch-geometric" },
 ]
 
 [package.optional-dependencies]
-dev = [
-    { name = "marimo" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
 examples = [
     { name = "cartopy" },
     { name = "matplotlib" },
     { name = "netcdf4" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+faiss = [
+    { name = "faiss-cpu" },
 ]
 notebooks = [
     { name = "cartopy" },
@@ -2160,17 +2156,22 @@ notebooks = [
     { name = "nbclient" },
     { name = "nbformat" },
     { name = "netcdf4" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "marimo" },
+    { name = "pytest" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "cartopy", marker = "extra == 'examples'", specifier = ">=0.24" },
     { name = "cartopy", marker = "extra == 'notebooks'", specifier = ">=0.24" },
-    { name = "faiss-cpu", specifier = ">=1.11,<1.16" },
+    { name = "faiss-cpu", marker = "sys_platform != 'darwin'", specifier = ">=1.11,<1.16" },
+    { name = "faiss-cpu", marker = "extra == 'faiss'", specifier = ">=1.11,<1.16" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6.29" },
-    { name = "marimo", marker = "extra == 'dev'", specifier = ">=0.25.2" },
     { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.9" },
     { name = "matplotlib", marker = "extra == 'notebooks'", specifier = ">=3.9" },
     { name = "nbclient", marker = "extra == 'notebooks'", specifier = ">=0.10" },
@@ -2178,15 +2179,18 @@ requires-dist = [
     { name = "netcdf4", marker = "extra == 'examples'", specifier = ">=1.7.4,<1.7.5" },
     { name = "netcdf4", marker = "extra == 'notebooks'", specifier = ">=1.7.4,<1.7.5" },
     { name = "numpy", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
-    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.13" },
-    { name = "scipy", marker = "extra == 'examples'", specifier = ">=1.13" },
-    { name = "scipy", marker = "extra == 'notebooks'", specifier = ">=1.13" },
+    { name = "scipy", specifier = ">=1.13" },
     { name = "torch", specifier = ">=2.6,<3" },
     { name = "torch-geometric", specifier = ">=2.6" },
 ]
-provides-extras = ["examples", "notebooks", "dev"]
+provides-extras = ["faiss", "examples", "notebooks"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "marimo", specifier = ">=0.25.2" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.9" },
+]
 
 [[package]]
 name = "numpy"

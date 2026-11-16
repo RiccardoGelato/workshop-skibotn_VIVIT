@@ -1,17 +1,21 @@
 """Graph helpers shared by the examples.
 
 ``nofe.graph.PointGraph`` owns the graph assembly — features, locations, edge features and the
-affinity target. What it cannot know is the neighbourhood rule, so the searches live here: a FAISS
-exact L2 index for both a radius and a k-nearest-neighbour graph, plus the banded raster variant the
+affinity target. What it cannot know is the neighbourhood rule, so the searches live here: an exact
+L2 radius and k-nearest search (on faiss, or cKDTree on macOS), plus the banded raster variant the
 ERA5 grid uses to stay buildable at stride 1.
+
+The index itself comes from :mod:`nofe.search`, so the examples and the package share one backend
+decision and one edge-ordering rule.
 """
 
 from __future__ import annotations
 
-import faiss
 import numpy as np
 import torch
 from torch import Tensor
+
+from nofe.search import NearestIndex, RadiusIndex, sorted_pairs
 
 
 def _as_points(pos: Tensor | np.ndarray, name: str = "pos") -> np.ndarray:
@@ -20,13 +24,6 @@ def _as_points(pos: Tensor | np.ndarray, name: str = "pos") -> np.ndarray:
     if points.ndim != 2:
         raise ValueError(f"{name} must be 2-D [num_nodes, position_dims], got shape {points.shape}")
     return points
-
-
-def _flat_index(points: np.ndarray, sources: np.ndarray) -> faiss.IndexFlatL2:
-    """Exact L2 index over ``points[sources]``; row ``i`` of the index is ``sources[i]``."""
-    index = faiss.IndexFlatL2(points.shape[1])
-    index.add(np.ascontiguousarray(points[sources], dtype=np.float32))
-    return index
 
 
 def tiled_radius_edges(
@@ -62,17 +59,10 @@ def tiled_radius_edges(
         stop = min(start + band, rows)
         lo = max(0, start - halo)
         hi = min(rows, stop + halo)
-        index = _flat_index(values, np.arange(lo * cols, hi * cols))
-        query_points = np.ascontiguousarray(values[start * cols : stop * cols], dtype=np.float32)
-        # L2 search reports squared distances, so the search radius is squared.
-        limits, _, found = index.range_search(query_points, float(radius) ** 2)
-        counts = np.diff(limits.astype(np.int64))
-        receiver = np.repeat(np.arange(start * cols, stop * cols, dtype=np.int64), counts)
-        # The index holds rows ``lo * cols`` onwards, so shift the hits back to global ids.
-        sender = found.astype(np.int64) + lo * cols
-        keep = sender != receiver
-        sender_parts.append(sender[keep])
-        receiver_parts.append(receiver[keep])
+        index = RadiusIndex(values, np.arange(lo * cols, hi * cols))
+        sender, receiver = index.within(np.arange(start * cols, stop * cols), radius)
+        sender_parts.append(sender)
+        receiver_parts.append(receiver)
 
     sender = np.concatenate(sender_parts)
     receiver = np.concatenate(receiver_parts)
@@ -80,8 +70,8 @@ def tiled_radius_edges(
         empty = torch.zeros(0, dtype=torch.long)
         return empty, empty.clone()
     # Sorted by (receiver, sender) across all bands, so the banding leaves no trace in the output.
-    order = np.lexsort((sender, receiver))
-    return torch.from_numpy(sender[order]), torch.from_numpy(receiver[order])
+    sender, receiver = sorted_pairs(sender, receiver)
+    return torch.from_numpy(sender), torch.from_numpy(receiver)
 
 
 def _pairs(
@@ -96,34 +86,13 @@ def _pairs(
     if sources.size == 0 or targets.size == 0:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
 
-    index = _flat_index(points, sources)
-    query_points = np.ascontiguousarray(points[targets], dtype=np.float32)
-
     if radius is not None:
-        # L2 search reports squared distances, so the search radius is squared.
-        limits, _, found = index.range_search(query_points, float(radius) ** 2)
-        # ``limits`` is uint64 and ``np.repeat`` refuses it against an int64 index otherwise.
-        counts = np.diff(limits.astype(np.int64))
-        receiver = np.repeat(np.asarray(targets, dtype=np.int64), counts)
-        # ``found`` holds index rows, whose ids are ``sources``; map them back to node ids.
-        sender = np.asarray(sources, dtype=np.int64)[found]
-        keep = sender != receiver
-        sender, receiver = sender[keep], receiver[keep]
+        sender, receiver = RadiusIndex(points, sources).within(targets, float(radius))
         # Sorted by (receiver, sender): deterministic edge order, so graphs are reproducible.
-        # ``lexsort``'s primary key is the last argument.
-        order = np.lexsort((sender, receiver))
-        return sender[order].astype(np.int64), receiver[order].astype(np.int64)
+        return sorted_pairs(sender, receiver)
 
     assert k is not None
-    kk = min(k + 1, len(sources))
-    found = index.search(query_points, kk)[1]
-    if found.ndim == 1:
-        found = found.reshape(-1, 1) if kk == 1 else found.reshape(1, -1)
-    # ``kk <= index.ntotal`` by construction, so FAISS never pads a row with its -1 sentinel.
-    receiver = np.repeat(np.asarray(targets, dtype=np.int64), found.shape[1])
-    sender = sources[found.reshape(-1)]
-    keep = sender != receiver
-    return sender[keep].astype(np.int64), receiver[keep].astype(np.int64)
+    return NearestIndex(points, sources).nearest(targets, int(k))
 
 
 def _build(
@@ -140,8 +109,8 @@ def _build(
     src_ids = np.arange(n) if sources is None else np.asarray(sources, dtype=np.int64)
     dst_ids = np.arange(n) if targets is None else np.asarray(targets, dtype=np.int64)
     sender, receiver = _pairs(points, src_ids, dst_ids, radius=radius, k=k)
-    order = np.lexsort((sender, receiver))
-    return torch.from_numpy(sender[order]), torch.from_numpy(receiver[order])
+    sender, receiver = sorted_pairs(sender, receiver)
+    return torch.from_numpy(sender), torch.from_numpy(receiver)
 
 
 def radius_edges(
@@ -154,7 +123,6 @@ def radius_edges(
     """Radius neighbourhood: ``(sender, receiver)`` pairs, senders from ``sources``."""
     if radius <= 0:
         raise ValueError(f"radius must be positive, got {radius}")
-    _as_points(pos)
     src = None if sources is None else np.asarray(sources, dtype=np.int64)
     dst = None if targets is None else np.asarray(targets, dtype=np.int64)
     return _build(pos, sources=src, targets=dst, radius=float(radius))
@@ -183,7 +151,6 @@ def knn_edges(
     """k-nearest-neighbour graph: ``(sender, receiver)`` pairs, senders from ``sources``."""
     if k < 1:
         raise ValueError(f"k must be at least 1, got {k}")
-    _as_points(pos)
     src = None if sources is None else np.asarray(sources, dtype=np.int64)
     dst = None if targets is None else np.asarray(targets, dtype=np.int64)
     return _build(pos, sources=src, targets=dst, k=int(k))
