@@ -26,29 +26,30 @@ One case, one operator:
 
 ## Install
 
-**`nofe` is not on PyPI**, so `uv add nofe` fails with `nofe was not found in the package registry`.
-Install it from the repository instead — pick the row that matches what you want:
+`nofe` is not on PyPI, so `uv add nofe` fails with `nofe was not found in the package registry`.
+Three installs, depending on what you need.
 
-| You want | Command |
-|---|---|
-| the library in your own project | `uv add "nofe @ git+ssh://git@github.com/laueb4818/workshop-skibotn.git"` |
-| the same with pip | `pip install "nofe @ git+ssh://git@github.com/laueb4818/workshop-skibotn.git"` |
-| to hack on `nofe` and use it live | `uv add --editable /path/to/NOFE-pkg` |
-| no git or SSH access | `uv build` in the repo, then `uv add /path/to/NOFE-pkg/dist/nofe-0.1.0-py3-none-any.whl` |
+### Just the library
 
-The repository is private, so the git forms need your SSH key (or a token:
-`git+https://<token>@github.com/...`). Building a wheel once sidesteps that for later installs.
+Add it to your own project from the repository:
 
-Two things the install does **not** give you:
+```bash
+uv add "nofe @ git+ssh://git@github.com/laueb4818/workshop-skibotn.git"
+```
 
-- **`examples/` is not in the wheel.** It lives outside `src/`, so the ERA5 and F3 demos, their
-  data and `examples/graph_utils.py` need the clone. The in-package equivalent of those helpers is
-  `nofe.search.RadiusIndex` / `NearestIndex` — see [Providing data](#providing-data).
-- **Pinning is up to you.** The git form tracks the default branch, but `uv` records the resolved
-  commit in `uv.lock`, so a checkout is reproducible until you run `uv lock --upgrade`. Add
-  `@<commit-sha>` when you want the constraint in `pyproject.toml` itself.
+Then `import nofe` works and nothing else is needed. The repository is private, so this needs your
+SSH key; with a token use `git+https://<token>@github.com/laueb4818/workshop-skibotn.git`.
 
-### Working in the repository
+`uv` records the resolved commit in your `uv.lock`, so installs are reproducible until you run
+`uv lock --upgrade`. Put `@<commit-sha>` in the URL when you want that pin in `pyproject.toml`.
+
+This install has no `examples/` — that directory lives outside `src/`, so the ERA5 and F3 demos,
+their data and `examples/graph_utils.py` are not included. If you only want the package, that is the
+whole story.
+
+### The repository, examples included
+
+Clone and sync if you want the demos, their data, or a copy of the code to read:
 
 ```bash
 git clone git@github.com:laueb4818/workshop-skibotn.git
@@ -69,21 +70,21 @@ Substitute the sync line for your platform:
 needs none of them. Both ERA5 dates ship in the clone, so the ERA5 pipeline runs with no download
 step; the 1.2 GB F3 volume is not tracked and `examples/seismic/README.md` says where to put it.
 
+### Editing `nofe` from another project
+
+If you are changing the package and want your project to see the changes live, install the clone as
+an editable dependency:
+
+```bash
+uv add --editable /path/to/workshop-skibotn
+```
+
+Edits under `src/nofe/` take effect on the next run; no reinstall, no version bump.
+
 `torch` is pinned as `torch>=2.6,<3`; the CUDA variant is selected by `UV_TORCH_BACKEND` at install
 time and the shipped `uv.lock` is backend-independent. Requires Python ≥ 3.11. Runtime dependencies
 are `torch`, `torch-geometric`, `numpy`, `scipy`, and `faiss-cpu` everywhere except macOS — see
 [Neighbour backend](#neighbour-backend).
-
-### Publishing, so `uv add nofe` works
-
-Nothing is published yet; the name is free on PyPI. To make the plain command work:
-
-```bash
-uv build                    # dist/nofe-0.1.0-py3-none-any.whl and the sdist
-uv publish                  # needs a PyPI token (UV_PUBLISH_TOKEN)
-```
-
-Until then, the install forms above are the supported ones.
 
 ## Neighbour backend
 
