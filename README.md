@@ -26,21 +26,64 @@ One case, one operator:
 
 ## Install
 
+**`nofe` is not on PyPI**, so `uv add nofe` fails with `nofe was not found in the package registry`.
+Install it from the repository instead — pick the row that matches what you want:
+
+| You want | Command |
+|---|---|
+| the library in your own project | `uv add "nofe @ git+ssh://git@github.com/laueb4818/workshop-skibotn.git"` |
+| the same with pip | `pip install "nofe @ git+ssh://git@github.com/laueb4818/workshop-skibotn.git"` |
+| to hack on `nofe` and use it live | `uv add --editable /path/to/NOFE-pkg` |
+| no git or SSH access | `uv build` in the repo, then `uv add /path/to/NOFE-pkg/dist/nofe-0.1.0-py3-none-any.whl` |
+
+The repository is private, so the git forms need your SSH key (or a token:
+`git+https://<token>@github.com/...`). Building a wheel once sidesteps that for later installs.
+
+Two things the install does **not** give you:
+
+- **`examples/` is not in the wheel.** It lives outside `src/`, so the ERA5 and F3 demos, their
+  data and `examples/graph_utils.py` need the clone. The in-package equivalent of those helpers is
+  `nofe.search.RadiusIndex` / `NearestIndex` — see [Providing data](#providing-data).
+- **Pinning is up to you.** The git form tracks the default branch, but `uv` records the resolved
+  commit in `uv.lock`, so a checkout is reproducible until you run `uv lock --upgrade`. Add
+  `@<commit-sha>` when you want the constraint in `pyproject.toml` itself.
+
+### Working in the repository
+
 ```bash
-uv add nofe        # or: pip install nofe
+git clone git@github.com:laueb4818/workshop-skibotn.git
+cd workshop-skibotn
+uv sync --all-groups --all-extras
 ```
+
+Substitute the sync line for your platform:
 
 | Target | Command |
 |---|---|
-| any platform, CPU | `UV_TORCH_BACKEND=cpu uv sync` |
-| Linux x86_64 + NVIDIA | `UV_TORCH_BACKEND=cu128 uv sync` (also `cu126`, `cu130`) |
-| macOS arm64 | `uv sync` (Metal/MPS is enabled in the default macOS wheel) |
-| Windows AMD64 | `UV_TORCH_BACKEND=cpu uv sync` |
+| any platform, CPU | `UV_TORCH_BACKEND=cpu uv sync --all-groups --all-extras` |
+| Linux x86_64 + NVIDIA | `UV_TORCH_BACKEND=cu128 uv sync --all-groups --all-extras` (also `cu126`, `cu130`) |
+| macOS arm64 | `uv sync --all-groups --all-extras` (Metal/MPS is enabled in the default macOS wheel) |
+| Windows AMD64 | `UV_TORCH_BACKEND=cpu uv sync --all-groups --all-extras` |
+
+`--all-extras` is what pulls `cartopy`/`matplotlib`/`netCDF4` for the examples; the library itself
+needs none of them. Both ERA5 dates ship in the clone, so the ERA5 pipeline runs with no download
+step; the 1.2 GB F3 volume is not tracked and `examples/seismic/README.md` says where to put it.
 
 `torch` is pinned as `torch>=2.6,<3`; the CUDA variant is selected by `UV_TORCH_BACKEND` at install
 time and the shipped `uv.lock` is backend-independent. Requires Python ≥ 3.11. Runtime dependencies
 are `torch`, `torch-geometric`, `numpy`, `scipy`, and `faiss-cpu` everywhere except macOS — see
 [Neighbour backend](#neighbour-backend).
+
+### Publishing, so `uv add nofe` works
+
+Nothing is published yet; the name is free on PyPI. To make the plain command work:
+
+```bash
+uv build                    # dist/nofe-0.1.0-py3-none-any.whl and the sdist
+uv publish                  # needs a PyPI token (UV_PUBLISH_TOKEN)
+```
+
+Until then, the install forms above are the supported ones.
 
 ## Neighbour backend
 
