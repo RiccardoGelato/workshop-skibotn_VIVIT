@@ -41,15 +41,12 @@ CACHE = Path(__file__).resolve().parents[1] / "f3_embedding.npz"
 # width=8, ker_width=32 are the reference NOFE settings; the message tensor is [edges, width], so
 # width drives peak memory. chunk_size is the Nyström query chunk: 262144 keeps the 541,501 queries
 # to three passes per step, which is what makes a full-cube epoch affordable on CPU.
-CONFIG = {
-    "width": 8,
-    "ker_width": 32,
-    "epochs": 60,
-    "patience": 15,
-    "seed": 0,
-    "device": "cpu",
-    "chunk_size": 262_144,
-}
+WIDTH = 8
+KER_WIDTH = 32
+EPOCHS = 60
+PATIENCE = 15
+SEED = 0
+CHUNK_SIZE = 262_144
 
 
 def colour_scale(
@@ -171,7 +168,7 @@ def run(cube: F3Cube, epochs: int):
     started = time.time()
     source_rows, source_cols, depth = cube.geometry()
     features, rows, cols = cube.load()
-    data = cube.build(features, rows, cols)
+    data = cube.build_cube(features, rows, cols)
     print(
         f"F3 cube {source_rows}x{source_cols} bins ({source_rows * BIN_KM:.1f} km x "
         f"{source_cols * BIN_KM:.1f} km), {depth} vertical samples per trace"
@@ -180,11 +177,18 @@ def run(cube: F3Cube, epochs: int):
         "domain: one node per horizontal location; feature space: the trace of vertical amplitudes"
     )
 
-    model = NOFE(dim=3, config={**CONFIG, "epochs": epochs, "nystrom": NYSTROM})
-    history = model.train(data)
+    model = NOFE(
+        3,
+        width=WIDTH,
+        ker_width=KER_WIDTH,
+        nystrom=NYSTROM,
+        chunk_size=CHUNK_SIZE,
+        device="cpu",
+    )
+    history = model.training(data, epochs=epochs, patience=PATIENCE, seed=SEED)
     print(
         f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} after "
-        f"{len(history)} epochs (best val {model.best_val_loss:.6f})"
+        f"{len(history)} epochs (best val {history[-1]['best_val_loss']:.6f})"
     )
     # Training and inference share one graph, so these two numbers are the same quantity: the score
     # is not an artefact of scoring a different neighbourhood than the one trained on.
@@ -229,7 +233,7 @@ def main() -> None:
         default=1,
         help="inline/crossline stride; 1 is every trace, 2 halves the graph for a quick look",
     )
-    parser.add_argument("--epochs", type=int, default=CONFIG["epochs"])
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
     args = parser.parse_args()
 
     cube = F3Cube(radius_km=args.radius_km, stride=args.stride, data_dir=args.data)
@@ -247,7 +251,7 @@ def main() -> None:
 
     # A trained operator has to beat its own first epoch, and the embedding must not have collapsed
     # onto one channel or left traces undrawn.
-    assert model.best_val_loss < history[0]["train_loss"], model.best_val_loss
+    assert history[-1]["best_val_loss"] < history[0]["train_loss"], history[-1]["best_val_loss"]
     assert embedding.shape == (rows_km.size * cols_km.size, 3), embedding.shape
     spread = embedding.std(axis=0)
     assert spread.min() > 0.05, spread

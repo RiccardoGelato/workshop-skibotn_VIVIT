@@ -63,12 +63,11 @@ sys.path.insert(0, str(ERA5 / "utilities"))
 sys.path.insert(0, str(REPO / "examples"))
 import era5  # noqa: E402
 from era5_graph import Era5Graph  # noqa: E402
-from graph_utils import knn_indices  # noqa: E402
 
 
-def kl(on, embedding) -> float:
+def kl(data, embedding) -> float:
     \"\"\"Mean KL between a graph's own feature affinities and an embedding of its rows.\"\"\"
-    return float(affinity_kl_loss(on.x, embedding, on.edge_index, on.num_nodes))
+    return float(affinity_kl_loss(data.x, embedding, data.edge_index, num_nodes=data.num_nodes))
 
 
 def pca_baseline(data, dims: int = 3) -> torch.Tensor:
@@ -78,13 +77,21 @@ def pca_baseline(data, dims: int = 3) -> torch.Tensor:
     return centred @ basis[:dims].T
 
 
+def neighbour_sets(points: torch.Tensor, k: int = 10) -> np.ndarray:
+    \"\"\"Exact ``k``-nearest-neighbour ids per row, self excluded.\"\"\"
+    import faiss
+
+    values = np.ascontiguousarray(points.detach().cpu().numpy(), dtype=np.float32)
+    index = faiss.IndexFlatL2(values.shape[1])
+    index.add(values)
+    return index.search(values, k + 1)[1][:, 1:]
+
+
 def knn_agreement(reference: torch.Tensor, candidate: torch.Tensor, k: int = 10) -> float:
     \"\"\"Mean share of exact k-nearest neighbours two point sets have in common.\"\"\"
-    ref = reference.detach().cpu().numpy()
-    cand = candidate.detach().cpu().numpy()
-    ref_nn = knn_indices(ref, k)
-    cand_nn = knn_indices(cand, k)
-    shared = [len(set(a) & set(b)) / k for a, b in zip(ref_nn, cand_nn, strict=True)]
+    ref = neighbour_sets(reference, k)
+    cand = neighbour_sets(candidate, k)
+    shared = [len(set(a) & set(b)) / k for a, b in zip(ref, cand, strict=True)]
     return float(np.mean(shared))
 
 
@@ -100,8 +107,7 @@ LOAD = """\
 # TRAIN_STRIDE=8 is the whole globe at 89 x 180 = 16,020 grid points. Lower the stride for a finer
 # grid (4 -> 64,440, 3 -> 114,720, 2 -> 258,480, 1 -> 719 x 1440 = 1,035,360).
 TRAIN_STRIDE = 8
-# Chord on the unit sphere: a 2.5 degree arc. At stride 8 under observed-only senders at 20%
-# withheld this gives a mean of 11.37 neighbours per receiver and 16 isolated nodes (0.10%).
+# Chord on the unit sphere: a 2.5 degree arc, giving a mean of ~12 neighbours per grid point.
 TRAIN_RADIUS = 0.04363
 # Inference grid and the chord that keeps the same mean degree there. The radius must shrink with
 # the stride: 2.5 degrees at stride 1 would be ~917M edges (~40 GB), which cannot be built.
@@ -117,23 +123,12 @@ print(
 )
 """
 
-CONFIG = """\
-CONFIG = {
-    "width": 8,
-    "ker_width": 32,
-    "epochs": 200,
-    "seed": 0,
-    "early_stopping": False,
-    "verbose": True,
-    "log_every": 50,
-    "nystrom": NYSTROM,
-}"""
-
-CONFIG_DOC = """\
+MODEL_DOC = """\
 `width=8, ker_width=32` are the reference ERA5 settings: `NNConv` materialises an
 `[num_edges, width]` message tensor, so width drives memory. 200 epochs at this resolution takes
-well under a minute on an M-series GPU; `verbose=True, log_every=50` prints progress and the final
-epoch always prints."""
+well under a minute on an M-series GPU. `NOFE` is the trainer and holds the network as `.net`; the
+input and edge widths are discovered on the first forward pass, so nothing has to be declared here.
+"""
 
 METRIC_DOC = """\
 ### How to read the score
@@ -162,17 +157,16 @@ in_sample = notebook(
     [
         new_markdown_cell(
             """\
-# 1 — Everything observed: train and infer on one graph
+# 1 — One graph: train and embed every grid point
 
-The simplest workflow. Every grid point has features, so nothing is withheld:
+The base case. Every grid point has features and is also a location, so nothing is withheld and
+nothing is queried:
 
-- `graph.build(features, lat, lon)` returns a `Data` with **no** `input_mask`, `output_mask` or
-  `y`.
-- `train` scores every row. The internal train/validation split chooses which rows enter the
-  objective; it never hides neighbours.
-- `embed` returns exactly `num_nodes` rows.
-
-This is the baseline the other two notebooks build on."""
+- `Era5Graph.build_raster(features, lat, lon)` returns a `Data` with one node per grid point, its
+  affinities in `data.affinity`, and no masks.
+- `model.training(graph)` scores every node; the internal train/validation split chooses which rows
+  enter the objective each epoch, it never hides neighbours.
+- `model.embed(graph)` returns exactly `num_nodes` rows, in node order."""
         ),
         new_code_cell(SHARED),
         new_markdown_cell(
@@ -188,46 +182,44 @@ the poles are ordinary neighbours for the radius graph."""
             """\
 ## Build the graph
 
-`Era5Graph` is radius-only: every observed row within `TRAIN_RADIUS` of a receiver sends it a
-message. Edges are built once, here; the operator only consumes `edge_index`/`edge_attr`, so any
-other neighbourhood you assemble works identically."""
+`Era5Graph` is radius-only: every grid point within `TRAIN_RADIUS` of a receiver sends it a message,
+banded by latitude so even a stride-1 raster stays buildable. The graph also carries the target: the
+student-t affinities of each node's feature rows against its own neighbourhood, which is what the
+loss reproduces."""
         ),
         new_code_cell(
             """\
-data = graph.build(features, latitudes, longitudes)
+data = graph.build_raster(features, latitudes, longitudes)
 print(data)
 print(
-    "masks:",
-    getattr(data, "input_mask", None),
-    getattr(data, "output_mask", None),
-    "| truth in y:",
-    getattr(data, "y", None) is not None,
+    "edges", data.edge_index.shape[1],
+    "| edge_attr width", data.edge_attr.shape[1],
+    "| affinity entries", data.affinity.shape[0],
 )
-print(
-    "every node both sends and receives:",
-    set(data.edge_index[0].tolist()) == set(range(data.num_nodes)),
-)
+# Era5Graph passes normalize=False: `load` already standardised every variable, so `pos` and
+# `pos_raw` are the same unit-sphere coordinates here. `PointGraph`'s default would z-score them.
+print("pos is raw for this builder:", torch.equal(data.pos, data.pos_raw))
+assert data.affinity.shape[0] == data.edge_index.shape[1]
 """
         ),
-        new_markdown_cell("## Train\n\n" + CONFIG_DOC),
+        new_markdown_cell("## Train\n\n" + MODEL_DOC),
         new_code_cell(
-            CONFIG
-            + """
-
-model = NOFE(dim=3, config=CONFIG)
-history = model.train(data)
+            """\
+model = NOFE(3, width=8, ker_width=32, nystrom=NYSTROM)
+history = model.training(data, epochs=200, seed=0, verbose=True, log_every=50)
 print(
     f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} "
-    f"| best val {model.best_val_loss:.6f}"
+    f"| best val {history[-1]['best_val_loss']:.6f}"
 )
+print("resolved widths:", model.net.in_channels, model.net.edge_channels)
 """
         ),
         new_markdown_cell(
             """\
-## Infer on the same data
+## Embed the same data
 
-`embed` returns one row per `output_mask` node — here every node — in node order (lat-major,
-matching the raster). `loss` is the mean KL over the same rows."""
+`embed` returns one row per node in node order (lat-major, matching the raster). `loss` is the mean
+KL over the same rows, read from the graph's own `affinity`."""
         ),
         new_code_cell(
             """\
@@ -276,10 +268,11 @@ plt.show()
         ),
         new_markdown_cell(
             """\
-## Save and reload
+## Checkpointing
 
-Checkpoints are self-describing (`nofe-checkpoint-2`): dim, config, model config, weights and the
-best validation loss. Reloading reproduces the embedding to floating-point tolerance.
+`NOFE` is a plain trainer, not an `nn.Module`, so the checkpoint is the network's own state dict:
+`torch.save(model.net.state_dict(), path)`. Reloading reproduces the embedding to floating-point
+tolerance.
 
 On MPS the comparison is *not* bit-exact: repeating the same forward pass twice already differs by
 ~4e-6 (measured here), and reloading adds ~6e-6, on embeddings whose magnitude is ~20. That is
@@ -288,8 +281,10 @@ assertion below uses a relative tolerance for that reason."""
         ),
         new_code_cell(
             """\
-path = model.save("in_sample.pt")
-restored = NOFE.load(path)
+path = Path("in_sample.pt")
+torch.save(model.net.state_dict(), path)
+restored = NOFE(3, width=8, ker_width=32, nystrom=NYSTROM, in_channels=11, edge_channels=7)
+restored.net.load_state_dict(torch.load(path, weights_only=True))
 rebuilt = restored.embed(data)
 print(
     f"restore max abs diff: {(rebuilt - embedding).abs().max():.2e}"
@@ -302,23 +297,21 @@ path.unlink()
         ),
         new_markdown_cell(
             """\
-## Part B — train coarse, infer fine
+## Part B — train coarse, embed fine
 
 Training needs the whole edge set resident at once, because the objective sees every neighbour on
-every epoch. Inference does not: it is one forward pass per chunk, so it can cover a grid whose
-graph could never be held alongside the optimiser.
+every epoch. Inference does not: it is one forward pass, so it can cover a grid whose graph could
+never be held alongside the optimiser.
 
-So train on the coarse grid and embed a finer one. `build(..., radius=)` overrides the constructor's
-chord for a single call, and the fine graph is never trained on."""
+The radius is fixed at construction, so a second `Era5Graph` at the finer stride carries its own
+chord. The fine graph is never trained on."""
         ),
         new_code_cell(
             """\
 fine = Era5Graph(radius=INFER_RADIUS, stride=INFER_STRIDE, data_dir=DATA)
 fine_features, fine_latitudes, fine_longitudes = fine.load("2018-01-01")
-fine_data = fine.build(
-    fine_features, fine_latitudes, fine_longitudes, radius=INFER_RADIUS
-)
-print(f"fine grid: {fine_data.num_nodes} nodes, {fine_data.num_edges} edges")
+fine_data = fine.build_raster(fine_features, fine_latitudes, fine_longitudes)
+print(f"fine grid: {fine_data.num_nodes} nodes, {fine_data.edge_index.shape[1]} edges")
 print(
     "mean in-degree:",
     float(torch.bincount(fine_data.edge_index[1], minlength=fine_data.num_nodes).float().mean()),
@@ -372,528 +365,12 @@ plt.show()
 
 |Fact|Why it matters|
 |---|---|
-|No `input_mask`, no `y`|A fully observed graph needs neither; `embed` covers every node|
-|`embed` returns `num_nodes` rows|Default `output_mask` is every node|
-|One graph, one pass|The dense operator sees the entire edge set on every epoch|
-
-Next: **2-held-out-training.ipynb** withholds part of the same date and trains on a merged graph."""
-        ),
-    ]
-)
-
-# 2 --------------------------------------------------------------------------------------
-held_out = notebook(
-    [
-        new_markdown_cell(
-            """\
-# 2 — Withhold locations, train on a merged graph, predict two ways
-
-Out-of-sample embedding: some locations have no features. The generator merges **locations, not
-features** — the node set is every grid point, observed rows first and the withheld ones after, the
-added rows get a `fill` substitute in `x`, keep their truth in `y`, and receive messages without
-sending any (`input_mask=False`).
-
-Two graphs come out of one date:
-
-|Graph|Built with|What it can do|
-|---|---|---|
-|`merged`|`query_mask=withheld, query_features=f`|train with truth for both parts|
-|`blind`|`query_mask=withheld` only|true out-of-sample: `embed` only|
-
-The last sections train on `merged` and predict twice on the **same coarse graph**: once for the
-observed rows only, once for every location."""
-        ),
-        new_code_cell(SHARED),
-        new_code_cell(LOAD),
-        new_markdown_cell(
-            """\
-## Hold out a random subset of locations
-
-A fixed fraction of grid points is withheld at random, mimicking scattered missing sensors. Any
-subset works: the caller decides what to withhold, and there is no holdout fraction anywhere in the
-API. The seed is fixed so the split is reproducible.
-
-Random selection spreads the withheld points across the whole globe, which is a fairer test of
-out-of-sample prediction than a contiguous gap: nearly every withheld point has observed
-neighbours right beside it, rather than sitting in the middle of a large empty region."""
-        ),
-        new_code_cell(
-            """\
-def split_nodes(num_nodes: int, fraction: float, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    \"\"\"Boolean masks: withhold ``fraction`` of the locations, chosen uniformly at random.\"\"\"
-    rng = np.random.default_rng(seed)
-    withheld = rng.random(num_nodes) < fraction
-    return ~withheld, withheld
-
-
-HELD_OUT = 0.2
-observed_mask, withheld_mask = split_nodes(flat.shape[0], HELD_OUT)
-num_observed = int(observed_mask.sum())
-print(
-    f"observed {num_observed}  withheld {int(withheld_mask.sum())}  "
-    f"of {observed_mask.size} locations ({HELD_OUT:.0%} held out)"
-)
-assert withheld_mask.any() and observed_mask.any()
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Build the two graphs
-
-`merged` keeps the withheld rows' truth in `y`. `blind` is the same graph without `y`, which is
-exactly what inference looks like when no truth exists.
-
-`merged` and `blind` are bit-identical apart from `y`: same `x`, `pos`, `input_mask` and
-`edge_index`. That is the training/inference parity guarantee."""
-        ),
-        new_code_cell(
-            """\
-# `query_mask` names the withheld rows; `merged` and `blind` differ only in whether their truth is
-# supplied. An observed-rows-only view is a restricted `output_mask` on the same graph (below), not
-# a separate graph: building one on the retained rows alone would give it different edges.
-merged = graph.build(features, latitudes, longitudes,
-                     query_mask=withheld_mask, query_features=features)
-blind = graph.build(features, latitudes, longitudes, query_mask=withheld_mask)
-
-for label, built in (("merged", merged), ("blind", blind)):
-    truth = "yes" if getattr(built, "y", None) is not None else "no"
-    print(f"{label:9s} nodes {built.num_nodes:6d}  edges {built.num_edges:7d}  y {truth}")
-
-print(
-    "merged/blind differ only in y:",
-    torch.equal(merged.x, blind.x) and torch.equal(merged.edge_index, blind.edge_index),
-)
-# `merged` orders nodes as observed-first then added, so senders are the prefix 0..num_observed-1.
-print(
-    "added rows receive only:",
-    set(merged.edge_index[0].tolist()) == set(range(num_observed)),
-    "| every node receives:",
-    set(merged.edge_index[1].tolist()) == set(range(merged.num_nodes)),
-)
-"""
-        ),
-        new_markdown_cell(
-            """\
-## The substitute is not the truth
-
-`x` on the added rows holds the inverse-distance interpolation of the `k` nearest observed rows.
-The real features live only in `y` and never enter the model input. Swap `fill=` to compare the
-three strategies."""
-        ),
-        new_code_cell(
-            """\
-added = slice(num_observed, None)
-print("added rows hold the fill substitute:", not torch.equal(merged.x[added], merged.y[added]))
-print(f"substitute max abs error vs truth: {(merged.x[added] - merged.y[added]).abs().max():.4f}")
-print(
-    "observed rows are exact:",
-    torch.equal(merged.x[:num_observed], merged.y[:num_observed]),
-)
-for mode in ("interpolate", "zeros", "mean"):
-    candidate = graph.build(
-        features, latitudes, longitudes, query_mask=withheld_mask, fill=mode
-    )
-    delta = (candidate.x[added] - merged.y[added]).abs().mean()
-    print(f"fill={mode:12s} mean abs error on the added rows: {delta:.4f}")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Train on the merged graph
-
-`y` carries real features for **both** the observed and the withheld rows, while the model only ever
-sees the substitute on the withheld ones. The Nyström objective scores every `output_mask` row from
-`y`, out-of-sample rows included; only the senders are restricted to `input_mask`.
-
-`blind` is refused by `train`/`loss`: its scored rows hold substitutes and there is no truth to
-score them against. `embed` still works on it.
-
-"""
-            + CONFIG_DOC
-        ),
-        new_code_cell(
-            CONFIG
-            + """
-
-model = NOFE(dim=3, config=CONFIG)
-history = model.train(merged)
-print(
-    f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} "
-    f"| mean KL on merged {model.loss(merged):.6f}"
-)
-
-try:
-    model.train(blind)
-except ValueError as error:
-    print("blind graph refused, as designed:", str(error)[:78], "...")
-
-reference = pca_baseline(merged, dims=3)
-print(f"PCA-3 KL on the same graph: {kl(merged, reference):.6f} (model must beat it)")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Two predictions on the same coarse graph
-
-Both calls embed the graph the model was trained on and differ only in `output_mask`:
-
-- **all locations** — `merged` as built: every node is scored, the withheld points included.
-- **observed only** — clone `merged` and clear `output_mask` on the withheld rows. The graph, its
-  edges and the substitute in `x` are untouched, so the model sees exactly the same input; only
-  which rows come back changes.
-
-`validate_graph` enforces `input_mask ⊆ output_mask`, so a restriction may only narrow to a
-superset of the observed rows. Rows come back in ascending node order."""
-        ),
-        new_code_cell(
-            """\
-all_locations = model.embed(merged)
-assert all_locations.shape == (merged.num_nodes, 3)
-
-# `merged` reorders nodes: observed rows first, then the added ones. Its own `input_mask` already
-# marks exactly those rows, so it is the restriction — a mask in original grid order would not be.
-observed_only = merged.clone()
-observed_only.output_mask = merged.input_mask
-observed_prediction = model.embed(observed_only)
-assert observed_prediction.shape == (num_observed, 3)
-
-print("all locations :", tuple(all_locations.shape))
-print("observed only :", tuple(observed_prediction.shape))
-max_diff = (observed_prediction - all_locations[:num_observed]).abs().max()
-print(f"max diff vs the matching prefix: {max_diff:.2e} (MPS re-runs differ at this order)")
-assert close(observed_prediction, all_locations[:num_observed])
-print("observed-only rows are the matching prefix of the full prediction: True")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Score both predictions
-
-`loss` scores the `output_mask` rows and reads the truth from `y`, on both operators. The full view
-includes the withheld points — their truth is in `y` even though `x` holds only the substitute — so
-the difference between the two numbers is the out-of-sample cost.
-
-The contract requires `input_mask ⊆ output_mask`, so the withheld points cannot be scored *alone*:
-observed-rows-only and every-row are the two supported views."""
-        ),
-        new_code_cell(
-            """\
-all_kl = model.loss(merged)
-observed_kl = model.loss(observed_only)
-print(f"KL on all rows      : {all_kl:.6f}")
-print(f"KL on observed rows : {observed_kl:.6f}")
-print(f"out-of-sample penalty from the withheld points: {all_kl - observed_kl:+.6f}")
-assert all_kl < kl(merged, reference), "the model should beat linear PCA on the merged graph"
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Visualise all locations vs observed only
-
-The panels differ **only** in which rows are drawn, so they share one colour scale — computed
-from the full prediction — and identical nodes get identical colours in both.
-
-Top: every location, including the withheld ones (the added rows receive messages from their
-observed neighbours). Bottom: the observed rows only, with the withheld cells left blank. That
-panel is not the model's output for those rows, it is the same embedding with the unobserved cells
-hidden, so the scattered points the model had to extrapolate stand out."""
-        ),
-        new_code_cell(
-            """\
-import cartopy.crs as ccrs
-import matplotlib.pyplot as plt
-
-# `merged` is ordered known-first, so a graph row's id is not its grid id: the generator reports
-# the grid id of every row through `observed_index`/`withheld_index`, and this array is the
-# graph-row -> grid-id map the scatter needs.
-row_grid = np.empty(merged.num_nodes, dtype=np.int64)
-row_grid[:num_observed] = merged.observed_index.numpy()
-row_grid[num_observed:] = merged.withheld_index.numpy()
-
-
-def to_grid(graph_rows: torch.Tensor) -> np.ndarray:
-    \"\"\"Graph-order embedding rows back into the original lat/lon raster order.\"\"\"
-    values = np.full((row_grid.size, 3), np.nan, dtype=np.float32)
-    values[row_grid] = graph_rows.detach().cpu().numpy()
-    return values
-
-
-# A permuted scatter still fills the raster and still draws a plausible globe, so check the truth
-# features land back where they came from before reading anything into the picture.
-assert np.allclose(to_grid(merged.y[:, :3]), flat[:, :3], atol=1e-4), "grid scatter is permuted"
-
-
-full_grid = to_grid(all_locations)
-observed_grid = np.full_like(full_grid, np.nan)
-observed_grid[observed_mask] = full_grid[observed_mask]
-print(
-    "blank cells — full:",
-    int(np.isnan(full_grid).any(axis=1).sum()),
-    "| observed only:",
-    int(np.isnan(observed_grid).any(axis=1).sum()),
-)
-
-# One scale from the full prediction, so a given node has the same colour in both panels.
-scale = era5.colour_scale(full_grid, era5.PERCENTILE)
-
-figure, axes = plt.subplots(
-    2, 1, figsize=(12.0, 11.0), subplot_kw={"projection": ccrs.PlateCarree()}
-)
-for axis, (title, values, shown) in zip(
-    axes,
-    (
-        ("all locations predicted", full_grid, merged.num_nodes),
-        ("observed rows only", observed_grid, num_observed),
-    ),
-    strict=True,
-):
-    axis.set_global()
-    era5.draw_globe(axis, latitudes, longitudes, values, scale=scale)
-    axis.coastlines(linewidth=0.5)
-    axis.set_title(f"{title} ({shown} of {merged.num_nodes} nodes)")
-plt.show()
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Takeaways
-
-|Fact|Why it matters|
-|---|---|
-|Merging unions locations|Added rows are unknown-featured either way|
-|`y` holds the truth|The model never sees it as input; only the objective does|
-|`input_mask` is provenance|Picks landmarks, senders and scorability; never masks the forward pass|
-|`output_mask` chooses the prediction rows|Same graph, same inputs, different returned subset|
-
-Next: **3-transfer-between-dates.ipynb** trains on this date and predicts on another."""
-        ),
-    ]
-)
-
-# 3 --------------------------------------------------------------------------------------
-transfer = notebook(
-    [
-        new_markdown_cell(
-            """\
-# 3 — Train on one date, predict on another
-
-A graph is just data: `train` and `embed` never assume the inference graph is the training one.
-This notebook trains on **2018-01-01** and embeds **2018-01-02**, whose network is a different
-`Data` object with its own edges.
-
-Two inference inputs are shown:
-
-1. **fully observed** — the new date is complete, so it embeds `num_nodes` rows;
-2. **partly observed** — half its locations are withheld through `query_mask`, which is what
-   deployment looks like when new locations arrive without features.
-
-Both files are in `examples/era5/data/`."""
-        ),
-        new_code_cell(SHARED),
-        new_markdown_cell(
-            """\
-## Load both dates at the same resolution
-
-Same `stride` gives identical lat/lon axes — convenient for plotting, and *not* required for the
-transfer to work."""
-        ),
-        new_code_cell(
-            """\
-STRIDE = 8
-# Chord on the unit sphere: a 2.5 degree arc, the same neighbourhood as notebook 1.
-RADIUS = 0.04363
-NYSTROM = 0.25
-graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
-train_features, train_latitudes, train_longitudes = graph.load("2018-01-01")
-test_features, test_latitudes, test_longitudes = graph.load("2018-01-02")
-assert np.array_equal(train_latitudes, test_latitudes)
-assert np.array_equal(train_longitudes, test_longitudes)
-
-print(
-    "training date nodes:",
-    train_features.shape[0] * train_features.shape[1],
-    "| new date nodes:",
-    test_features.shape[0] * test_features.shape[1],
-)
-"""
-        ),
-        new_markdown_cell("## Train on the first date\n\nNothing here knows a second date exists."),
-        new_code_cell(
-            CONFIG
-            + """
-
-train_graph = graph.build(train_features, train_latitudes, train_longitudes)
-model = NOFE(dim=3, config=CONFIG)
-history = model.train(train_graph)
-print(
-    f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} "
-    f"| mean KL {model.loss(train_graph):.6f}"
-)
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Predict on the second date, fully observed
-
-The new graph carries its own `x`, `pos` and edges. The only compatibility requirement is the
-widths: 11 input features and `2P + 1 = 7` edge channels, which the generator reproduces for any
-point set of the same dimension."""
-        ),
-        new_code_cell(
-            """\
-test_graph = graph.build(test_features, test_latitudes, test_longitudes)
-built = model.model.config
-print(
-    "feature width matches:",
-    test_graph.x.shape[1] == built["in_channels"],
-    "| edge width matches:",
-    test_graph.edge_attr.shape[1] == built["edge_channels"],
-)
-
-embedding_transfer = model.embed(test_graph)
-assert embedding_transfer.shape == (test_graph.num_nodes, 3)
-print("embedding on 2018-01-02:", tuple(embedding_transfer.shape))
-
-# The new date is fully observed, so its KL is a real score, not a placeholder.
-print(f"mean KL on the new date : {model.loss(test_graph):.6f}")
-print(f"PCA-3 KL on the new date: {kl(test_graph, pca_baseline(test_graph, dims=3)):.6f}")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Compare how each date maps into the shared embedding
-
-The embedding is a *function* of local feature neighbourhoods, so two dates land in the same space:
-similar weather regimes get similar colours even though the raw fields differ. The next cell
-quantifies that instead of eyeballing it."""
-        ),
-        new_code_cell(
-            """\
-train_embedding = model.embed(train_graph)
-print(f"KL on the training date: {kl(train_graph, train_embedding):.6f}")
-print(f"KL on the new date     : {kl(test_graph, embedding_transfer):.6f}")
-assert kl(test_graph, embedding_transfer) < kl(test_graph, pca_baseline(test_graph, dims=3))
-print("transfer beats linear PCA on the unseen date: True")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Partly observed second date
-
-Withhold half the locations of 2018-01-02 and pass that mask to the generator as `query_mask`.
-Their features become the `fill` substitute, they receive messages without sending any, and their
-truth — when supplied as `query_features` — goes to `y` for scoring only.
-
-`test_blind` is the honest deployment case: no truth exists for the new locations."""
-        ),
-        new_code_cell(
-            """\
-rng = np.random.default_rng(0)
-observed_test = rng.random(test_latitudes.size * test_longitudes.size) < 0.5
-print(f"observed {observed_test.sum()} of {observed_test.size} locations on the second date")
-
-test_merged = graph.build(
-    test_features, test_latitudes, test_longitudes,
-    query_mask=~observed_test, query_features=test_features,
-)
-test_blind = graph.build(
-    test_features, test_latitudes, test_longitudes, query_mask=~observed_test
-)
-print(
-    "merged and blind agree on the graph:",
-    torch.equal(test_merged.x, test_blind.x)
-    and torch.equal(test_merged.edge_index, test_blind.edge_index),
-)
-
-predicted = model.embed(test_blind)
-print("prediction for all locations:", tuple(predicted.shape))
-print(f"mean KL where truth exists   : {model.loss(test_merged):.6f}")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Two ways to predict the partly observed date
-
-`output_mask` picks which rows come back. Restricting it to the observed rows reproduces a plain
-observed-only prediction; leaving it wide returns the withheld locations too. The graph, its edges
-and every `x` row are identical in both calls."""
-        ),
-        new_code_cell(
-            """\
-# `test_blind` reorders nodes (observed first, then added), and its own `input_mask` marks the
-# observed prefix. A mask in grid order would not line up with the graph's rows.
-observed_rows = test_blind.clone()
-observed_rows.output_mask = test_blind.input_mask
-observed_prediction = model.embed(observed_rows)
-num_observed_test = int(observed_test.sum())
-
-print("all locations :", tuple(predicted.shape))
-print("observed only :", tuple(observed_prediction.shape))
-max_diff = (observed_prediction - predicted[:num_observed_test]).abs().max()
-print(f"max diff vs the matching prefix: {max_diff:.2e}")
-assert close(observed_prediction, predicted[:num_observed_test])
-print("observed-only rows are the matching prefix of the full prediction: True")
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Visualise the transfer
-
-Top to bottom: the training date, the new date fully observed, and the new date with half its
-locations withheld and predicted."""
-        ),
-        new_code_cell(
-            """\
-import cartopy.crs as ccrs
-import matplotlib.pyplot as plt
-
-# `predicted` is in graph order (known rows first), so it needs the graph-row -> grid-id map
-# before it can be drawn; `test_merged.y` is the check that the map points the right way.
-row_grid_test = np.empty(test_merged.num_nodes, dtype=np.int64)
-row_grid_test[:num_observed_test] = test_merged.observed_index.numpy()
-row_grid_test[num_observed_test:] = test_merged.withheld_index.numpy()
-predicted_grid = np.full((row_grid_test.size, 3), np.nan, dtype=np.float32)
-predicted_grid[row_grid_test] = predicted.numpy()
-# A permuted scatter still looks like a globe, so pin it against the truth before reading the map.
-test_flat = test_features.reshape(-1, test_features.shape[2])
-check = np.full((row_grid_test.size, 3), np.nan, dtype=np.float32)
-check[row_grid_test] = test_merged.y[:, :3].numpy()
-assert np.allclose(check, test_flat[:, :3], atol=1e-4), "grid scatter is permuted"
-
-panels = [
-    ("2018-01-01 (training)", train_embedding.numpy()),
-    ("2018-01-02 (fully observed)", embedding_transfer.numpy()),
-    ("2018-01-02 (half withheld, predicted)", predicted_grid),
-]
-
-# All three panels share one colour scale, computed from the training embedding: without it each
-# panel would rescale independently and the same weather regime would get a different colour.
-scale = era5.colour_scale(panels[0][1], era5.PERCENTILE)
-
-figure, axes = plt.subplots(
-    3, 1, figsize=(12.0, 15.5), subplot_kw={"projection": ccrs.PlateCarree()}
-)
-for axis, (title, values) in zip(axes, panels, strict=True):
-    axis.set_global()
-    era5.draw_globe(axis, test_latitudes, test_longitudes, values, scale=scale)
-    axis.coastlines(linewidth=0.5)
-    axis.set_title(f"{title}: {values.shape[0]} nodes")
-plt.show()
-"""
-        ),
-        new_markdown_cell(
-            """\
-## Takeaways
-
-|Fact|Why it matters|
-|---|---|
-|`train` and `embed` take different `Data`|A graph is data, not state; transfer needs no re-fitting|
-|Only the widths must match|`in_channels` = features, `edge_channels` = `2P + 1`|
-|`blind` graphs are embed-only|`train`/`loss` refuse scored rows holding substitutes with no `y`|
-|`output_mask` chooses the rows|Same graph and inputs; only the returned subset changes|
-
-To adapt to the new date rather than just score it, build a fresh `NOFE` and call `train` on the new
-graph; nothing about the objects changes."""
+|One node per feature row|Every supplier of features is also a location; nothing is withheld|
+|`data.affinity` is the target|The loss reads it off the graph; no truth lives anywhere else|
+|`embed` returns `num_nodes` rows|One row per node, in node order|
+|Widths resolve on the first forward|`net.in_channels` exists only after a graph was seen|
+
+Next: **4-many-graphs.ipynb** trains one operator on several subgraphs of the same date."""
         ),
     ]
 )
@@ -903,9 +380,9 @@ many_graphs = notebook(
     [
         new_markdown_cell(
             """\
-# 4 — Sample several graphs from one date, train on all of them, infer on another
+# 4 — Several graphs from one date, trained together, applied to another
 
-One date is one graph, but `train` also takes a list. Here the training set is **four random
+One date is one graph, but `training` also takes a list. Here the training set is **four random
 subsets of the 2018-01-01 grid points at stride `STRIDE`**, each a `Data` with its own nodes and
 its own edges; the trained model is then applied to the **complete 2019-08-01 field at native
 stride 1** — 1,035,360 locations of a date it never saw, on a grid finer than anything it trained
@@ -919,46 +396,37 @@ reported `train_loss`/`val_loss` are the means over those graphs."""
             """\
 ## Sample subgraphs from the first date
 
-Each subgraph keeps a random `FRACTION` of the grid points, drawn with its own seed: same radius,
-fewer points, so about 3% of the kept nodes end up with no neighbour inside their own subgraph.
-They are not broken — a node with no incoming edge is embedded from its own features through the
-root weight — but they carry no neighbourhood information, which is why the in-degree is printed
-rather than assumed."""
+Each subgraph keeps a random `SAMPLE` of the grid points (`PointGraph(sample=...)`, drawn with its
+own seed): same radius, fewer points, so a few percent of the kept nodes end up with no neighbour
+inside their own subgraph. They are not broken — a node with no incoming edge is embedded from its
+own features through the root weight — but they carry no neighbourhood information, which is why the
+in-degree is printed rather than assumed."""
         ),
         new_code_cell(
             """\
-from graph_utils import merge_queries, radius_edges
-
 STRIDE = 8
-# Chord on the unit sphere: a 2.5 degree arc, the same neighbourhood as notebooks 1-3.
+# Chord on the unit sphere: a 2.5 degree arc, the same neighbourhood as notebook 1.
 RADIUS = 0.04363
-FRACTION = 0.5
+SAMPLE = 8_010  # half of the 16,020 stride-8 grid points
 NUM_GRAPHS = 4
 
 graph = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA)
 features, latitudes, longitudes = graph.load("2018-01-01")
-positions = graph.positions(latitudes, longitudes)
-flat = features.reshape(-1, features.shape[2])
-print(f"{flat.shape[0]} grid points on 2018-01-01, {flat.shape[1]} variables each")
+print(f"{features.shape[0] * features.shape[1]} grid points on 2018-01-01, "
+      f"{features.shape[2]} variables each")
 
 
 def sample_graph(seed: int):
     \"\"\"A random subset of the grid points, with a radius neighbourhood of its own.\"\"\"
-    keep = np.random.default_rng(seed).random(flat.shape[0]) < FRACTION
-    return merge_queries(
-        positions[keep],
-        flat[keep],
-        edge_builder=lambda pos, sources, targets: radius_edges(
-            pos, RADIUS, sources=sources, targets=targets
-        ),
-    )
+    builder = Era5Graph(radius=RADIUS, stride=STRIDE, data_dir=DATA, sample=SAMPLE, seed=seed)
+    return builder.build_raster(features, latitudes, longitudes)
 
 
 graphs = [sample_graph(seed) for seed in range(NUM_GRAPHS)]
 for index, sampled in enumerate(graphs):
     degrees = torch.bincount(sampled.edge_index[1], minlength=sampled.num_nodes)
     print(
-        f"graph {index}: {sampled.num_nodes} nodes, {sampled.num_edges} edges, "
+        f"graph {index}: {sampled.num_nodes} nodes, {sampled.edge_index.shape[1]} edges, "
         f"mean in-degree {degrees.float().mean():.2f}, isolated {int((degrees == 0).sum())}"
     )
 """
@@ -967,31 +435,19 @@ for index, sampled in enumerate(graphs):
             """\
 ## Train on the list
 
-`train` runs one optimizer step per graph per epoch and averages the losses it reports. `loss` on a
-list is the unweighted mean over graphs, so it equals the mean of the per-graph scores below —
-`loss([a, b, c, d]) == mean(loss(a), loss(b), loss(c), loss(d))`."""
+`training` runs one optimizer step per graph per epoch, returns one history per graph, and averages
+the losses it reports. `loss` on a list returns one float per graph, so the list is the per-graph
+scores below in order."""
         ),
         new_code_cell(
             """\
-CONFIG = {
-    "width": 8,
-    "ker_width": 32,
-    "epochs": 200,
-    "seed": 0,
-    "early_stopping": True,
-    "verbose": True,
-    "log_every": 25,
-    "nystrom": 0.25,
-}
-
-model = NOFE(dim=3, config=CONFIG)
-history = model.train(graphs)
-per_graph = [model.loss(sampled) for sampled in graphs]
-print(f"{len(history)} epochs, {len(history) * len(graphs)} optimizer steps")
-print(f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f}")
+model = NOFE(3, width=8, ker_width=32, nystrom=0.25)
+histories = model.training(graphs, epochs=200, seed=0, verbose=True)
+per_graph = model.loss(graphs)
+print(f"{len(histories[0])} epochs, {len(histories[0]) * len(graphs)} optimizer steps")
+print(f"graph 0 loss {histories[0][0]['train_loss']:.5f} -> {histories[0][-1]['train_loss']:.6f}")
 print("mean KL per graph:", [round(value, 6) for value in per_graph])
-print(f"mean KL over the list: {model.loss(graphs):.6f}")
-assert abs(model.loss(graphs) - np.mean(per_graph)) < 1e-6
+assert len(histories) == len(per_graph) == NUM_GRAPHS
 """
         ),
         new_markdown_cell(
@@ -999,9 +455,9 @@ assert abs(model.loss(graphs) - np.mean(per_graph)) < 1e-6
 ## Infer on the full second date, at native resolution
 
 Training ran on 50% samples at `STRIDE`, because the objective needs every training edge resident
-on every epoch. Inference does not: it is one forward pass per chunk, so it can cover the whole
-grid. The model is therefore applied to **all 719 x 1440 = 1,035,360 grid points** of 2019-08-01 at
-stride 1, a grid it has never seen.
+on every epoch. Inference does not: it is one forward pass, so it can cover the whole grid. The
+model is therefore applied to **all 719 x 1440 = 1,035,360 grid points** of 2019-08-01 at stride 1,
+a grid it has never seen.
 
 The radius has to shrink with the stride — 2.5 degrees at stride 1 would be ~917M edges (~40 GB) —
 and `0.005454` keeps the neighbourhood the fine grid can hold. `embed` stays single-graph and
@@ -1013,12 +469,11 @@ INFER_STRIDE = 1
 INFER_RADIUS = 0.005454
 full_graph = Era5Graph(radius=INFER_RADIUS, stride=INFER_STRIDE, data_dir=DATA)
 full_features, full_latitudes, full_longitudes = full_graph.load("2019-08-01")
-full = full_graph.build(full_features, full_latitudes, full_longitudes)
-print(f"full grid: {full.num_nodes} nodes, {full.num_edges} edges")
+full = full_graph.build_raster(full_features, full_latitudes, full_longitudes)
+print(f"full grid: {full.num_nodes} nodes, {full.edge_index.shape[1]} edges")
 
 embedding = model.embed(full)
 print("embedding on 2019-08-01:", tuple(embedding.shape))
-print(f"mean KL on the unseen date: {model.loss(full):.6f}")
 assert embedding.shape == (full.num_nodes, 3)
 assert torch.isfinite(embedding).all()
 """
@@ -1051,11 +506,11 @@ plt.show()
 
 |Fact|Why it matters|
 |---|---|
-|`train` takes a list|One operator covers many graphs; an epoch is one step per graph|
-|Graphs need only matching widths|The samples are independent `Data` objects with their own edges|
-|`loss` on a list is a mean over graphs|Each graph counts once, whatever its node count|
+|`training` takes a list|One operator covers many graphs; an epoch is one step per graph|
+|`sample=N` draws N rows|A subgraph is the same builder with fewer points, nothing else|
+|`loss` on a list is per graph|Each graph counts once, whatever its node count|
 |Inference needs no training grid|A coarse, sub-sampled model embeds the full-resolution field|
-|`embed` takes one graph|Inference loop over the list if many embeddings are needed|"""
+|`embed` takes one graph or a list|It returns the matching type: one tensor, or one per graph|"""
         ),
     ]
 )
@@ -1063,8 +518,6 @@ plt.show()
 
 NOTEBOOKS = (
     ("1-in-sample.ipynb", in_sample),
-    ("2-held-out-training.ipynb", held_out),
-    ("3-transfer-between-dates.ipynb", transfer),
     ("4-many-graphs.ipynb", many_graphs),
 )
 

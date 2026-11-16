@@ -6,14 +6,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-
-def node_indices(data: Data, name: str) -> np.ndarray:
-    """Node ids selected by a mask attribute, or every node when absent."""
-    mask = getattr(data, name, None)
-    if mask is None:
-        return np.arange(data.num_nodes)
-    flags = torch.as_tensor(mask).flatten().to(device="cpu", dtype=torch.bool)
-    return flags.nonzero().numpy().reshape(-1)
+from .affinity import affinities
 
 
 class NystromSampler:
@@ -33,16 +26,16 @@ class NystromSampler:
 
     @property
     def landmark_fraction(self) -> float:
-        """The fraction of the input rows used as landmarks."""
+        """The fraction of the nodes used as landmarks."""
         return self.transition
 
-    def landmark_count(self, num_inputs: int) -> int:
-        """Landmarks drawn from ``num_inputs`` rows: the fraction becomes a count here."""
-        return min(int(num_inputs), max(1, round(int(num_inputs) * self.transition)))
+    def landmark_count(self, num_nodes: int) -> int:
+        """Landmarks drawn from ``num_nodes`` nodes: the fraction becomes a count here."""
+        return min(int(num_nodes), max(1, round(int(num_nodes) * self.transition)))
 
     @staticmethod
     def query_count(num_outputs: int) -> int:
-        """Queries used per step; every output row, chunked by ``chunk_size``."""
+        """Queries used per step; every node, chunked by ``chunk_size``."""
         return int(num_outputs)
 
     @staticmethod
@@ -85,17 +78,11 @@ class NystromSampler:
 
         Edges are ``data``'s own, filtered to landmark senders and active receivers, so the
         subgraph inherits the neighbourhood of the graph it was handed. Their features are copied
-        from ``data.edge_attr`` too, because the edge kernel was trained on them.
+        from ``data.edge_attr`` too, because the edge kernel was trained on them. The target
+        affinities are recomputed on the subgraph, from the features of the nodes it holds.
         """
         queries = np.asarray(queries, dtype=np.int64).reshape(-1)
         landmarks = np.asarray(landmarks, dtype=np.int64).reshape(-1)
-
-        every_output = node_indices(data, "output_mask")
-        every_input = node_indices(data, "input_mask")
-        if not np.isin(queries, every_output).all():
-            raise ValueError("queries must be selected by output_mask")
-        if not np.isin(landmarks, every_input).all():
-            raise ValueError("landmarks must be selected by input_mask")
 
         active = np.concatenate((queries, landmarks[~np.isin(landmarks, queries)]))
         senders, receivers, kept = self._subgraph_pairs(data, active, landmarks)
@@ -107,10 +94,7 @@ class NystromSampler:
 
         index = torch.as_tensor(active, dtype=torch.long)
         pos = data.pos[index].to(device).float()
-        # Features are copied unchanged: added rows already hold the substitute the dense path
-        # sees, so zeroing them here would make the two paths disagree about the model input.
         x = data.x[index].to(device).float()
-        target = getattr(data, "y", None)
 
         edge_index = torch.as_tensor(mapped, dtype=torch.long, device=device)
         kept_index = torch.as_tensor(np.flatnonzero(kept), dtype=torch.long)
@@ -124,21 +108,9 @@ class NystromSampler:
         edge_attr = data.edge_attr.to(device).float()[kept_index]
 
         active_graph = Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
-        # ``y`` travels with ``x``: a withheld query row has no features of its own, so its only
-        # target distribution is the truth the caller put in ``y``. Without this the Nyström
-        # objective falls back to ``x`` and silently skips every out-of-sample row.
-        if target is not None:
-            active_graph.y = target[index].to(device).float()
         active_graph.edge_dist = edge_dist
+        active_graph.affinity = affinities(x, edge_index, active.size)[0]
         active_graph.query_mask = torch.zeros(len(active), dtype=torch.bool, device=device)
         active_graph.query_mask[: len(queries)] = True
         active_graph.global_indices = index
-        output_mask = getattr(data, "output_mask", None)
-        if output_mask is not None:
-            active_graph.output_mask = (
-                torch.as_tensor(output_mask)
-                .flatten()
-                .to(device="cpu", dtype=torch.bool)[index]
-                .to(device)
-            )
         return active_graph

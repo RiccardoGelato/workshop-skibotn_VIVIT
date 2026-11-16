@@ -71,3 +71,18 @@ def test_empty_edges_give_zero_loss_with_gradient() -> None:
     assert values.shape == (2,)
     assert not valid.any()
     assert values.abs().sum() == 0.0
+
+
+def test_precomputed_weights_match_the_target_path() -> None:
+    values, edge_index = _graph()
+    prediction = torch.tensor([[0.2], [1.4], [2.1], [0.9]], dtype=torch.float32)
+    weights = affinities(values, edge_index)[0]
+
+    recomputed = affinity_kl_loss(values, prediction, edge_index)
+    supplied = affinity_kl_loss(values, prediction, edge_index, weights=weights)
+    targetless = affinity_kl_loss(None, prediction, edge_index, weights=weights)
+    assert torch.allclose(supplied, recomputed, atol=1e-7)
+    assert torch.allclose(targetless, recomputed, atol=1e-7)
+
+    with pytest.raises(ValueError, match="target is required"):
+        affinity_kl_loss(None, prediction, edge_index)

@@ -8,21 +8,22 @@ dependencies = [
     "numpy>=2.0",
     "torch>=2.6,<3",
     "torch-geometric>=2.6",
+    # faiss-cpu is capped below 1.16: that is the last series publishing a `macosx_14_0_arm64` wheel
+    # (1.16.0 jumps to `macosx_15_0_arm64` and ships no sdist), and torch 2.15 supports macOS 14.
+    # It is a runtime dependency because a `PointGraph` subclass's `neighbour_pairs` is a nearest-
+    # neighbour search, and the reference implementations here use its exact L2 index.
+    "faiss-cpu>=1.11,<1.16",
 ]
 
-# faiss-cpu is capped below 1.16: that is the last series publishing a `macosx_14_0_arm64` wheel
-# (1.16.0 jumps to `macosx_15_0_arm64` and ships no sdist), and torch 2.15 supports macOS 14.
 [project.optional-dependencies]
 examples = [
     "cartopy>=0.24",
-    "faiss-cpu>=1.11,<1.16",
     "matplotlib>=3.9",
     "netCDF4>=1.7.4,<1.7.5",
     "scipy>=1.13",
 ]
 notebooks = [
     "cartopy>=0.24",
-    "faiss-cpu>=1.11,<1.16",
     "ipykernel>=6.29",
     "matplotlib>=3.9",
     "nbclient>=0.10",
@@ -31,13 +32,12 @@ notebooks = [
     "scipy>=1.13",
 ]
 
-# The tests build graphs with the example helpers, so they need scipy and faiss-cpu too. `marimo`
-# runs `examples/seismic/notebooks/clusters.py`, the interactive version of the clustering sweep.
+# `marimo` runs `examples/seismic/notebooks/clusters.py`, the interactive version of the clustering
+# sweep.
 dev = [
     "pytest>=8",
     "ruff>=0.9",
     "scipy>=1.13",
-    "faiss-cpu>=1.11,<1.16",
     "marimo>=0.25.2",
 ]
 

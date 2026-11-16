@@ -3,16 +3,15 @@
 __version__ = "0.1.0"
 
 from .affinity import affinities, affinity_kl_loss
-from .model import EdgeConv, KernelNN
-from .nofe import NOFE
-from .nystrom import NystromSampler
+from .graph import PointGraph
+from .model import NOFE, EdgeConv, KernelNN
 from .runtime import get_device, set_seed
 
 __all__ = [
     "NOFE",
     "EdgeConv",
     "KernelNN",
-    "NystromSampler",
+    "PointGraph",
     "affinities",
     "affinity_kl_loss",
     "get_device",

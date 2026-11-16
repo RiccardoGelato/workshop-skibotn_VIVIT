@@ -34,16 +34,16 @@ NYSTROM = 0.25
 PERCENTILE = 5
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "era5_embedding.png"
-# chunk_size is the Nyström query chunk. The 8192 default splits 258,480 queries into 32 passes and
-# takes ~185 s/epoch here; 65536 needs ~10 s/epoch for the same result, only more resident memory.
-CONFIG = {
-    "width": 8,
-    "ker_width": 32,
-    "epochs": 80,
-    "patience": 20,
-    "seed": 0,
-    "chunk_size": 65_536,
-}
+# width=8, ker_width=32 are the reference settings: NNConv materialises an [num_edges, width]
+# message tensor, so width drives peak memory. chunk_size is the Nyström query chunk: the 8192
+# default splits 258,480 queries into 32 passes and takes ~185 s/epoch here; 65536 needs ~10 s/epoch
+# for the same result, only more resident memory.
+WIDTH = 8
+KER_WIDTH = 32
+EPOCHS = 80
+PATIENCE = 20
+SEED = 0
+CHUNK_SIZE = 65_536
 
 
 def colour_scale(
@@ -235,7 +235,7 @@ def main() -> None:
     graph = Era5Graph(radius=TRAIN_RADIUS, stride=args.train_stride, data_dir=args.data)
     features, latitudes, longitudes = graph.load(args.date)
     train_lat, train_lon = features.shape[:2]
-    data = graph.build(features, latitudes, longitudes)
+    data = graph.build_raster(features, latitudes, longitudes)
     print(
         f"{args.date}.nc: {train_lat}x{train_lon} = {data.num_nodes} nodes over the globe, "
         f"{features.shape[2]} variables, {data.num_edges} edges"
@@ -245,11 +245,11 @@ def main() -> None:
         "feature space: the 11 variables at each point"
     )
 
-    model = NOFE(dim=3, config={**CONFIG, "nystrom": NYSTROM})
-    history = model.train(data)
+    model = NOFE(3, width=WIDTH, ker_width=KER_WIDTH, nystrom=NYSTROM, chunk_size=CHUNK_SIZE)
+    history = model.training(data, epochs=EPOCHS, patience=PATIENCE, seed=SEED)
     print(
         f"loss {history[0]['train_loss']:.5f} -> {history[-1]['train_loss']:.6f} after "
-        f"{len(history)} epochs (best val {model.best_val_loss:.6f})"
+        f"{len(history)} epochs (best val {history[-1]['best_val_loss']:.6f})"
     )
 
     # Training needs the whole edge set resident; inference is one forward pass, so the finer graph
@@ -263,11 +263,10 @@ def main() -> None:
         infer_graph = Era5Graph(radius=INFER_RADIUS, stride=args.infer_stride, data_dir=args.data)
         fine_features, fine_lat, fine_lon = infer_graph.load(args.date)
         num_lat, num_lon = fine_features.shape[:2]
-        infer_data = infer_graph.build(fine_features, fine_lat, fine_lon, radius=INFER_RADIUS)
+        infer_data = infer_graph.build_raster(fine_features, fine_lat, fine_lon)
         embedding = model.embed(infer_data).numpy()
         plot_lat, plot_lon = fine_lat, fine_lon
-    # Scored on the training graph: the fine grid is embed-only, and its KL would need truth for
-    # every fine row.
+    # Scored on the training graph, which carries its own affinity target.
     mean_kl = model.loss(data)
     print(
         f"embedding {tuple(embedding.shape)} on the stride-{args.infer_stride} grid; "
@@ -288,7 +287,7 @@ def main() -> None:
     colours = rgba_colours(embedding)
     spread = embedding.std(axis=0)
     assert history[-1]["train_loss"] < 0.02, history[-1]["train_loss"]
-    assert model.best_val_loss < 0.02, model.best_val_loss
+    assert history[-1]["best_val_loss"] < 0.02, history[-1]["best_val_loss"]
     assert mean_kl < 0.02, mean_kl
     assert embedding.shape == (infer_data.num_nodes, 3)
     assert spread.min() > 0.05, spread

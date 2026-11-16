@@ -2131,6 +2131,7 @@ name = "nofe"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "faiss-cpu" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
@@ -2139,7 +2140,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "faiss-cpu" },
     { name = "marimo" },
     { name = "pytest" },
     { name = "ruff" },
@@ -2148,7 +2148,6 @@ dev = [
 ]
 examples = [
     { name = "cartopy" },
-    { name = "faiss-cpu" },
     { name = "matplotlib" },
     { name = "netcdf4" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -2156,7 +2155,6 @@ examples = [
 ]
 notebooks = [
     { name = "cartopy" },
-    { name = "faiss-cpu" },
     { name = "ipykernel" },
     { name = "matplotlib" },
     { name = "nbclient" },
@@ -2170,9 +2168,7 @@ notebooks = [
 requires-dist = [
     { name = "cartopy", marker = "extra == 'examples'", specifier = ">=0.24" },
     { name = "cartopy", marker = "extra == 'notebooks'", specifier = ">=0.24" },
-    { name = "faiss-cpu", marker = "extra == 'dev'", specifier = ">=1.11,<1.16" },
-    { name = "faiss-cpu", marker = "extra == 'examples'", specifier = ">=1.11,<1.16" },
-    { name = "faiss-cpu", marker = "extra == 'notebooks'", specifier = ">=1.11,<1.16" },
+    { name = "faiss-cpu", specifier = ">=1.11,<1.16" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6.29" },
     { name = "marimo", marker = "extra == 'dev'", specifier = ">=0.25.2" },
     { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.9" },

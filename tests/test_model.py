@@ -44,7 +44,7 @@ def test_chunked_message_matches_stock_conv() -> None:
 
 
 def test_edge_batch_size_does_not_change_output() -> None:
-    x, edge_index, edge_attr, kernel = _fixture()
+    x, edge_index, edge_attr, _ = _fixture()
     _, _, _, shared = _fixture()
     source = EdgeConv(4, copy.deepcopy(shared), edge_batch_size=None)
     torch.manual_seed(7)
@@ -58,22 +58,21 @@ def test_edge_batch_size_does_not_change_output() -> None:
 
 
 def test_empty_edges_return_one_row_per_node() -> None:
-    model = KernelNN(3, 5, 2, width=8, ker_width=8, depth=2)
+    model = KernelNN(2, in_channels=3, edge_channels=5, width=8, ker_width=8, depth=2)
     empty_index = torch.empty((2, 0), dtype=torch.long)
     empty_attr = torch.empty((0, 5))
     out = model(torch.rand(6, 3), empty_index, empty_attr)
     assert out.shape == (6, 2)
 
 
-def test_config_round_trip_rebuilds_model() -> None:
+def test_state_dict_round_trip_rebuilds_the_operator() -> None:
     torch.manual_seed(1)
-    model = KernelNN(3, 5, 2, width=8, ker_width=8, depth=2, edge_batch_size=4)
-    rebuilt = KernelNN(**model.config)
-    assert rebuilt.config == model.config
+    model = KernelNN(2, in_channels=3, edge_channels=5, width=8, ker_width=8, depth=2)
+    rebuilt = KernelNN(2, in_channels=3, edge_channels=5, width=8, ker_width=8, depth=2)
     rebuilt.load_state_dict(model.state_dict())
 
     x = torch.rand(12, 3)
-    edge_index, edge_attr = _ring_edges(12, 3)
+    edge_index, _ = _ring_edges(12, 3)
     edge_attr = torch.rand(edge_index.shape[1], 5)
     assert torch.equal(rebuilt(x, edge_index, edge_attr), model(x, edge_index, edge_attr))
     assert rebuilt.depth == model.depth == 2

@@ -34,7 +34,6 @@ def _():
     from pathlib import Path
 
     import marimo as mo
-    import matplotlib
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -53,7 +52,6 @@ def _():
     # implementation of k-means, the sweep and the palette.
     sys.path.insert(0, str(REPO / "examples" / "seismic" / "utilities"))
     from clusters import cluster_colours, kmeans, sweep  # noqa: E402
-    from f3_graph import BIN_KM  # noqa: E402
 
     return CACHE, cluster_colours, kmeans, mo, np, plt, sweep
 

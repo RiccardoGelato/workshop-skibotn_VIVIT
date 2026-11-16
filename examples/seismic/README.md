@@ -35,9 +35,9 @@ Two facts from the shipped metadata drive the code:
 
 - **Vertical planes 0 and 254 are padding** — constant amplitude, class-0 labels throughout. They
   are dropped (`f3_graph.PADDING_PLANES`); a trace built from them would encode the padding.
-- `seismic.npy` is already `(seismic_raw - 0.0009997) / 0.2097655`. The loader standardises each
-  *vertical sample* across traces with global constants, fitted once and reused at any stride, so
-  shallow and deep amplitude stay comparable.
+- `seismic.npy` is already `(seismic_raw - 0.0009997) / 0.2097655`. On top of that, `PointGraph`'s
+  default `normalize=True` z-scores each of the 253 vertical samples across all traces of the graph
+  before the operator sees it, so shallow and deep amplitude stay comparable.
 
 ## Run
 

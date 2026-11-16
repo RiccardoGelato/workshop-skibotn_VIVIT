@@ -9,22 +9,21 @@ Two consequences drive the choices here:
 
 - **The domain is a regular raster**, so a radius neighbourhood is exactly a fixed set of
   (row, column) offsets. Deriving the offsets from the bin size is exact, needs no index search
-  even for 541,501 nodes, and gives the same physical operator support at any grid stride.
+  even for 541,501 nodes, and gives the same physical operator support at any grid stride. That is
+  the ``neighbour_pairs`` override below; thin the raster with ``stride`` on the loader rather than
+  with ``sample``, which would break the row-major lattice.
 - **The vertical axis is a feature axis, not a node axis.** Locations are connected laterally only;
   a node is one whole trace, so nothing about the layering is baked into the graph.
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch_geometric.data import Data
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from graph_utils import geometry_edge_attr  # noqa: E402
+from nofe import PointGraph
 
 # 25 m inline/crossline bin spacing of the F3 acquisition grid (Alaudah et al. 2019, sec. 3.2.2).
 BIN_KM = 0.025
@@ -32,11 +31,11 @@ BIN_KM = 0.025
 # flagged in the shipped metadata (`suspect_vertical_planes`), and a trace built from them would
 # describe the padding rather than the geology.
 PADDING_PLANES = (0, 254)
-DATA_SUFFIX = Path("data") / "f3-full-ready" / "f3-full" / "data" / "processed" / "f3" / "full"
+DATA_SUFFIX = "data/f3-full-ready/f3-full/data/processed/f3/full"
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / DATA_SUFFIX
 
 
-class F3Cube:
+class F3Cube(PointGraph):
     """Load the F3 volume and turn horizontal rasters of traces into ``Data`` graphs."""
 
     def __init__(
@@ -45,16 +44,18 @@ class F3Cube:
         radius_km: float = 0.1,
         data_dir: Path | None = None,
         stride: int = 1,
+        **kwargs,
     ) -> None:
         if radius_km <= 0:
             raise ValueError("radius_km must be positive")
         if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
             raise ValueError("stride must be a positive integer")
+        super().__init__(**kwargs)
         self.radius_km = float(radius_km)
         self.stride = int(stride)
         self.data_dir = Path(DEFAULT_DATA_DIR if data_dir is None else data_dir)
-        self._scale: tuple[np.ndarray, np.ndarray] | None = None
         self._shape: tuple[int, int, int] | None = None
+        self._raster: tuple[int, int] | None = None
 
     # -- data -----------------------------------------------------------------
 
@@ -125,38 +126,28 @@ class F3Cube:
         pos[:, 1] = np.tile(col_km, row_km.size)
         return pos
 
-    def normalise(self, features: np.ndarray) -> np.ndarray:
-        """Standardise every vertical sample by global constants, fitted once.
-
-        One global mean/std for the whole depth axis keeps the relative amplitude of shallow and
-        deep samples intact — a per-sample z-score would erase exactly the vertical structure the
-        embedding is asked to encode. The constants are cached, so the training raster and the
-        finer inference raster are scaled by the same numbers.
-        """
-        flattened = features.reshape(-1, features.shape[-1])
-        if self._scale is None:
-            probe = flattened[:: max(1, flattened.shape[0] // 20_000)]
-            self._scale = (probe.mean(axis=0), probe.std(axis=0) + 1e-6)
-        return self.apply_scale(flattened)
-
-    def apply_scale(self, features: np.ndarray) -> np.ndarray:
-        """Scale ``features`` with this cube's fitted constants, without refitting them."""
-        if self._scale is None:
-            raise RuntimeError("no normalisation constants yet; call normalise() first")
-        mean, std = self._scale
-        return ((features.reshape(-1, features.shape[-1]) - mean) / std).astype(np.float32)
-
-    def adopt_scale(self, other: F3Cube) -> None:
-        """Use ``other``'s normalisation constants, so two rasters share one feature scaling."""
-        if other._scale is None:
-            raise RuntimeError("the source cube has no normalisation constants yet")
-        self._scale = other._scale
-
-    def reset_scale(self) -> None:
-        """Forget the cached normalisation constants (fit them again on the next build)."""
-        self._scale = None
-
     # -- graph ----------------------------------------------------------------
+
+    def edge_parameters(self) -> tuple[float, int]:
+        """The lattice rule needs the radius; ``k`` is unused."""
+        return self.radius_km, 0
+
+    def neighbour_pairs(self, points: np.ndarray, radius: float, k: int):
+        """Exact lattice offsets for the complete raster the last load produced.
+
+        The rule assumes row-major node order with every location present, so it refuses a sampled
+        point set instead of silently connecting the wrong pairs; thin the cube with ``stride``.
+        """
+        if self._raster is None:
+            raise RuntimeError("call build_cube() or load() before neighbour_pairs()")
+        num_rows, num_cols = self._raster
+        if num_rows * num_cols != points.shape[0]:
+            raise ValueError(
+                f"the lattice rule needs all {num_rows * num_cols} raster points, got "
+                f"{points.shape[0]}; use stride= to thin the cube instead of sample="
+            )
+        edge_index = self._lattice_edges(num_rows, num_cols, self.offsets())
+        return edge_index[0].numpy(), edge_index[1].numpy()
 
     def _lattice_edges(
         self, num_rows: int, num_cols: int, offsets: list[tuple[int, int]]
@@ -186,26 +177,18 @@ class F3Cube:
         edge_index[1] = torch.from_numpy(dst[order])
         return edge_index
 
-    def build(self, features: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> Data:
-        """One node per retained trace, radius edges over the horizontal plane."""
-        num_rows, num_cols = features.shape[:2]
-        pos = self.positions(rows, cols)
-        edge_index = self._lattice_edges(num_rows, num_cols, self.offsets())
-        pos_tensor = torch.from_numpy(pos)
-        data = Data(
-            x=torch.from_numpy(self.normalise(features).copy()),
-            pos=pos_tensor,
-            edge_index=edge_index,
-            edge_attr=geometry_edge_attr(pos_tensor, edge_index),
-        )
-        data.grid_rows = int(num_rows)
-        data.grid_cols = int(num_cols)
+    def build_cube(self, features: np.ndarray, rows: np.ndarray, cols: np.ndarray):
+        """One node per trace: the trace is its feature vector, the raster its locations."""
+        self._raster = (int(features.shape[0]), int(features.shape[1]))
+        flat = features.reshape(-1, features.shape[2])
+        data = self.build(flat, self.positions(rows, cols))
+        data.grid_rows, data.grid_cols = self._raster
         data.source_rows = torch.from_numpy(np.asarray(rows, dtype=np.int64))
         data.source_cols = torch.from_numpy(np.asarray(cols, dtype=np.int64))
         self.report(data)
         return data
 
-    def report(self, data: Data) -> str:
+    def report(self, data) -> str:
         """Print and return the neighbourhood statistics of ``data``."""
         degrees = torch.bincount(data.edge_index[1], minlength=data.num_nodes)
         isolated = int((degrees == 0).sum())

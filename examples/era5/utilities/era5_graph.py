@@ -1,48 +1,59 @@
 """ERA5 graph generator: radius neighbourhoods over the global grid, plus node features.
 
-``nofe`` consumes a precomputed graph, so the ERA5 examples build theirs here. Coordinates are
-normalised Cartesian directions on a sphere of radius one, and the neighbourhood is a radius graph
-with observed rows as the only senders. The radius is a constructor default that ``build`` may
-override per call, so one grid resolution can be trained on and a finer one embedded.
+``nofe.graph.PointGraph`` owns assembly; this subclass supplies the two rules it cannot know: the
+radius neighbourhood (banded by latitude on a full raster, so a stride-1 grid stays buildable) and
+the radius itself. Coordinates are normalised Cartesian directions on a sphere of radius one, so a
+radius is a chord length and the poles and the antimeridian need no special casing.
+
+``normalize=False`` is deliberate: ``load`` already standardises every variable per field, and
+z-scoring the unit-sphere coordinates would turn the documented chord into a radius in a stretched
+space, changing which grid points are neighbours.
 """
 
 from __future__ import annotations
 
 import math
 import sys
-from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch import Tensor
-from torch_geometric.data import Data
+
+from nofe import PointGraph
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from graph_utils import geometry_edge_attr, radius_edges, raster_radius_edges  # noqa: E402
-from graph_utils import merge_queries as _merge_queries  # noqa: E402
+from graph_utils import radius_edges, raster_radius_edges  # noqa: E402
 
 EARTH_RADIUS = 6_371_000.0  # metres; positions are coordinates / EARTH_RADIUS
 VARIABLES = ("w", "v", "z", "q", "r", "t", "d", "o3", "pv", "u", "vo")
 DEFAULT_DATA_DIR = "/Volumes/T7-storage/ERA5/data"
-FILL = 10  # neighbours used by the inverse-distance substitute on withheld rows
 
 
-class Era5Graph:
-    """Build radius-neighbourhood graphs over the ERA5 grid, plus node features."""
+class Era5Graph(PointGraph):
+    """Radius-neighbourhood graphs over the ERA5 grid, plus node features."""
 
-    def __init__(self, *, radius: float, stride: int = 2, data_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        radius: float,
+        stride: int = 2,
+        data_dir: Path | None = None,
+        **kwargs,
+    ) -> None:
         if radius <= 0:
             raise ValueError("radius must be positive")
         if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
             raise ValueError("stride must be a positive integer")
+        super().__init__(normalize=False, **kwargs)
         self.radius = float(radius)
         self.stride = int(stride)
         self.data_dir = Path(DEFAULT_DATA_DIR if data_dir is None else data_dir)
+        self._raster: tuple[int, int] | None = None
 
     def positions(self, latitudes: np.ndarray, longitudes: np.ndarray) -> np.ndarray:
         """Coordinates are in earth radii, so ``|p| = 1`` for every node; a radius r is therefore a
         chord length, equal to ``2*sin(theta/2)`` for an angular separation theta."""
+        self._raster = (int(latitudes.size), int(longitudes.size))
         phi = np.deg2rad(np.repeat(latitudes, longitudes.size))
         lam = np.deg2rad(np.tile(longitudes, latitudes.size))
         unit = np.stack([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)], axis=1)
@@ -89,124 +100,47 @@ class Era5Graph:
             dataset.close()
         return np.stack(channels, axis=-1), latitudes[lat_rows], longitudes[lon_cols]
 
-    def _radius_edges(
-        self, pos: Tensor, sources: np.ndarray, targets: np.ndarray, radius: float | None = None
-    ) -> tuple[Tensor, Tensor]:
-        """Radius neighbourhood with ``sources`` sending and ``targets`` receiving."""
-        return radius_edges(
-            pos, self.radius if radius is None else radius, sources=sources, targets=targets
-        )
+    def edge_parameters(self) -> tuple[float, int]:
+        """The chord on the unit sphere; the radius graph ignores ``k``."""
+        return self.radius, 0
 
-    def _raster_radius_edges(
-        self,
-        pos: Tensor,
-        sources: np.ndarray,
-        targets: np.ndarray,
-        *,
-        rows: int,
-        cols: int,
-        radius: float | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Full-raster radius neighbourhood, banded by latitude so a fine grid stays buildable."""
-        neighbor, query = raster_radius_edges(
-            pos,
-            self.radius if radius is None else radius,
-            rows=rows,
-            cols=cols,
-            sources=sources,
-            targets=targets,
-        )
-        edge_index = torch.stack((neighbor, query))
-        return edge_index, geometry_edge_attr(pos, edge_index)
+    def neighbour_pairs(self, points: np.ndarray, radius: float, k: int) -> tuple:
+        """Radius pairs; a complete raster takes the latitude-banded search.
 
-    def build(
-        self,
-        features: np.ndarray,
-        latitudes: np.ndarray,
-        longitudes: np.ndarray,
-        *,
-        radius: float | None = None,
-        query_mask: np.ndarray | None = None,
-        query_features: np.ndarray | None = None,
-        fill: str = "interpolate",
-    ) -> Data:
-        """Raster adapter: positions and features plus ``query_mask`` to a ``Data``.
-
-        This is the mask-shaped door for callers that hold a full raster (the ERA5 example and the
-        notebooks); it splits the raster into known and withheld rows and delegates to
-        ``graph_utils.merge_queries``, the block form. Passing the grid ids through keeps
-        ``data.observed_index``/``data.withheld_index`` in grid order, so a caller can scatter graph
-        rows back into its own raster. Queried locations off the raster go through
-        ``merge_queries(graph.positions(lat, lon), ...)`` directly.
-
-        ``radius`` overrides the constructor's chord for this call only, so one ``Era5Graph`` can
-        serve a coarse training grid and a fine inference grid. The mask-free (fully observed) case
-        builds its edges banded by latitude, whose cost grows with the local neighbourhood rather
-        than with the square of the node count.
-
-        Locations, not features, are unioned: withheld rows are placed in the graph after the
-        known ones, receive their neighbours' messages and send none, keep a ``fill`` substitute in
-        ``x`` and their truth in ``y``.
+        The banded search is exact only over the whole raster, so it is used when the point set is
+        exactly the grid the last :meth:`positions` call described and nothing was sampled;
+        otherwise the straight index search applies the same rule.
         """
-        radius = self.radius if radius is None else float(radius)
-        if radius <= 0:
-            raise ValueError("radius must be positive")
-        pos = self.positions(latitudes, longitudes)
-        flat = features.reshape(-1, features.shape[2])
-        truth = None
-        if query_features is not None:
-            if query_features.shape[2:] != features.shape[2:]:
-                raise ValueError(
-                    f"query_features has {query_features.shape[-1]} channels but features has "
-                    f"{features.shape[2]}"
-                )
-            truth = query_features.reshape(flat.shape)
-        if query_mask is None:
-            builder = partial(
-                self._raster_radius_edges,
-                rows=features.shape[0],
-                cols=features.shape[1],
-                radius=radius,
-            )
-            data = _merge_queries(pos, flat, fill=fill, k=FILL, edge_builder=builder)
-            self.report(data, radius=radius)
-            return data
+        if self._raster is not None and self.sample is None:
+            rows, cols = self._raster
+            if rows * cols == points.shape[0]:
+                return raster_radius_edges(points, radius, rows=rows, cols=cols)
+        return radius_edges(points, radius)
 
-        flags = np.asarray(query_mask).reshape(-1).astype(bool)
-        if flags.size != flat.shape[0]:
-            raise ValueError(f"query_mask must have {flat.shape[0]} entries, got {flags.size}")
-        observed = np.flatnonzero(~flags)
-        withheld = np.flatnonzero(flags)
-        if observed.size == 0:
-            raise ValueError("query_mask withholds every row; nothing would be observed")
-        data = _merge_queries(
-            pos[observed],
-            flat[observed],
-            pos[withheld],
-            None if truth is None else truth[withheld],
-            ids=observed,
-            query_ids=withheld,
-            fill=fill,
-            k=FILL,
-            edge_builder=partial(self._radius_edges, radius=radius),
-        )
-        self.report(data, radius=radius)
-        return data
-
-    def report(self, data: Data, *, radius: float | None = None) -> str:
+    def report(self, data, *, radius: float | None = None) -> str:
         """Print and return the neighbour statistics of ``data``."""
         radius = self.radius if radius is None else float(radius)
         counts = torch.bincount(data.edge_index[1], minlength=data.num_nodes)
         mean = float(counts.float().mean())
         isolated = int((counts == 0).sum())
-        percent = 100.0 * isolated / max(1, data.num_nodes)
         arc = math.degrees(2.0 * math.asin(min(1.0, radius / 2.0)))
         text = (
             f"radius {radius:.5f} (chord on the unit sphere, {arc:.2f} deg arc), "
             f"{data.num_nodes} nodes, {data.edge_index.shape[1]} edges\n"
             f"mean neighbours per receiver: {mean:.2f}  "
-            f"max: {int(counts.max()) if counts.numel() else 0}\n"
-            f"nodes without a neighbour:    {isolated} ({percent:.2f}%)"
+            f"max: {int(counts.max()) if counts.numel() else 0}  "
+            f"receivers with no sender: {isolated}"
         )
         print(text)
         return text
+
+    def build_raster(self, features: np.ndarray, latitudes: np.ndarray, longitudes: np.ndarray):
+        """Raster adapter: one node per grid point, at its location on the unit sphere.
+
+        ``features`` is ``[lat, lon, variable]``; it is flattened to one row per grid point in
+        row-major (lat-major) order, which is the order the plotting helpers reshape back into.
+        """
+        flat = features.reshape(-1, features.shape[2])
+        data = self.build(flat, self.positions(latitudes, longitudes))
+        self.report(data)
+        return data
