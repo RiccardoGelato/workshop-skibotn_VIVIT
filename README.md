@@ -177,38 +177,37 @@ The edge features are `[2P + 1]`-wide for `P` location dimensions. `build` retur
 
 ### What the finished graph looks like
 
-One call to `build(features, locations)` gives a `Data` where every node is one of your rows, and
-every directed edge is a "receiver sees sender" relation. Concretely, for `N` rows, `F` features, `P`
-location dimensions and a neighbourhood that produced `E` edges:
+One call to `build(features, locations)` gives a `Data` where every node is one of your rows and
+every directed edge is a "receiver sees sender" relation. For `N` rows, `F` features, `P` location
+dimensions and a neighbourhood that produced `E` edges, `build` runs these steps in order:
 
-```text
-features [N, F]  locations [N, P]
-        |                  |
-        |   z-score both per column over all N rows   (normalize=True)
-        |                  |
-        |       keep N or sample=N rows               (seed, ascending order)
-        v                  v
-   x [N, F]  -------->  radius / k-NN search over pos [N, P]
-        |                  |
-        |                  +--> edge_index [2, E]      sender, receiver (excluding self)
-        |                  +--> edge_dist  [E]         |pos[sender] - pos[receiver]|
-        |                  +--> edge_attr  [E, 2P+1]   [pos[receiver], direction, relative dist]
-        |                  +--> pos_raw    [N, P]      your locations, unscaled
-        v
-   affinity [E]  = student-t weights of x[sender] vs x[receiver], normalised per receiver
-```
+| Step | Input | Operation | Output |
+|---|---|---|---|
+| 1. Validate | `features [N, F]`, `locations [N, P]` | both must be 2-D with the same row count | `ValueError` naming both counts otherwise |
+| 2. Scale | both arrays | z-score **per column**, fitted over all `N` rows, if `normalize=True` | scaled copies, still `N` rows |
+| 3. Sample | the scaled copies | `sample=None` keeps every row; `sample=n` keeps `n` random rows, ascending | `x [N', F]`, `pos [N', P]` |
+| 4. Search | `pos` | the subclass's `neighbour_pairs`, i.e. a radius or k-NN search over `pos` | `sender`, `receiver`, `E` pairs, self hits excluded |
+| 5. Order | the pairs | sort by `(receiver, sender)` | deterministic `edge_index [2, E]` (`int64`) |
+| 6. Edge features | `pos`, `edge_index` | `[pos[receiver], unit direction, relative distance]` | `edge_attr [E, 2P + 1]`, `edge_dist [E]` |
+| 7. Raw locations | `locations`, the kept rows | copy the caller's own values through | `pos_raw [N', P]` |
+| 8. Target | `x`, `edge_index` | student-t affinities of `x[sender]` vs `x[receiver]`, normalised per receiver | `affinity [E]` |
 
-Minimum shape rules, all enforced or produced by `build`:
+So the finished object always has exactly these fields:
 
-- `features.shape[0] == locations.shape[0] == N`; both 2-D. No self loops in `edge_index`.
-- `edge_index[0]` are senders, `edge_index[1]` receivers, sorted by `(receiver, sender)` so the same
-  input always yields the same order.
-- `edge_attr` width is `2P + 1`: the receiver's `P` coordinates, `P` components of the unit
-  direction toward it, and one relative distance. So 2-D locations give 5 columns, 3-D give 7.
-- `affinity` has one entry per edge and sums to `1` over each receiver's incoming edges.
+| Field | Shape | Holds |
+|---|---|---|
+| `x` | `[N', F]` | your features, scaled if `normalize=True` |
+| `pos` | `[N', P]` | the locations the search used, scaled the same way |
+| `pos_raw` | `[N', P]` | your locations exactly as passed, row-aligned with `pos` |
+| `edge_index` | `[2, E]` | `row 0` senders, `row 1` receivers, sorted by `(receiver, sender)` |
+| `edge_attr` | `[E, 2P + 1]` | the receiver's coordinates, the direction toward it, one relative distance |
+| `edge_dist` | `[E]` | edge length in the scaled space |
+| `affinity` | `[E]` | the loss target, summing to `1` over each receiver's incoming edges |
 
-A node with no incoming edge gets no affinity entry and is excluded from the loss, but still appears
-in `x` and `pos` and is still embedded (through the root weight). Check
+`N'` equals `N` unless you sampled. Two consequences worth knowing: `edge_attr` is `2P + 1` wide, so
+2-D locations give 5 columns and 3-D give 7 — that number is the model's `edge_channels`. And a node
+with no incoming edge gets no `affinity` entry, so it is excluded from the loss, but it stays in `x`
+and `pos` and is still embedded through the root weight. Check
 `torch.bincount(data.edge_index[1], minlength=data.num_nodes) == 0` if that matters.
 
 ### Normalization
@@ -243,23 +242,19 @@ KernelNN(out_dim=3, *, in_channels=None, edge_channels=None, width=32, ker_width
 
 ### What one forward pass does
 
-```text
-x [N, F]                    edge_attr [E, D]
-   |                             |
-   | lift: Linear F -> width     | kernel MLP: D -> ker_width -> ker_width -> width^2
-   v                             v    (one flattened width x width matrix per edge)
-h [N, width]  ---- depth x ---> EdgeConv: h_i' = W_root h_i + mean_{j -> i} M(edge_attr_ji) h_j
-   |                                  then ReLU
-   | project: Linear width -> out_dim
-   v
-z [N, out_dim]
-```
+| Step | Operates on | Computation | Output |
+|---|---|---|---|
+| 1. Lift | `x [N, F]` | `Linear(F -> width)` | `h [N, width]` |
+| 2. Edge kernel | `edge_attr [E, D]` | `Linear(D -> ker_width)`, ReLU, `Linear(ker_width -> ker_width)`, ReLU, `Linear(ker_width -> width²)` | one flattened `width × width` matrix per edge, `[E, width²]` |
+| 3. Convolve | `h`, `edge_index`, those matrices | `h_i' = W_root h_i + mean_{j -> i} M(edge_attr_ji) h_j`, then ReLU | `h [N, width]`, one hop further |
+| 4. Repeat | as step 3 | steps 2–3 run `depth` times off the *same* modules | `h [N, width]` |
+| 5. Project | `h` | `Linear(width -> out_dim)` | `z [N, out_dim]` |
 
-Aggregation is `mean` with a root weight, so a node needs no self loop and a node with no incoming
-edge is still embedded from its own features. `depth` convolutions are applied **repeatedly to the
-same `EdgeConv` module**, i.e. the weights are shared across the `depth` steps — it is a recurrence,
-not a stack. That is why `depth` costs no parameters and why a bigger `depth` widens the receptive
-field (each layer propagates one hop) at the cost of compute only.
+Steps 1 and 5 run once; the convolution is the repeated part. Aggregation is `mean` with a root
+weight `W_root`, so a node needs no self loop and a node with no incoming edge is still embedded from
+its own features. The `depth` steps reuse **one** `EdgeConv` module — the weights are shared across
+them, so it is a recurrence rather than a stack of layers. That is why `depth` costs no parameters
+and why raising it widens the receptive field (one hop per step) at the cost of compute only.
 
 ### Parameters
 
