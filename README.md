@@ -194,15 +194,20 @@ dimensions and a neighbourhood that produced `E` edges, `build` runs these steps
 
 So the finished object always has exactly these fields:
 
-| Field | Shape | Holds |
-|---|---|---|
-| `x` | `[N', F]` | your features, scaled if `normalize=True` |
-| `pos` | `[N', P]` | the locations the search used, scaled the same way |
-| `pos_raw` | `[N', P]` | your locations exactly as passed, row-aligned with `pos` |
-| `edge_index` | `[2, E]` | `row 0` senders, `row 1` receivers, sorted by `(receiver, sender)` |
-| `edge_attr` | `[E, 2P + 1]` | the receiver's coordinates, the direction toward it, one relative distance |
-| `edge_dist` | `[E]` | edge length in the scaled space |
-| `affinity` | `[E]` | the loss target, summing to `1` over each receiver's incoming edges |
+| Field | Shape | Holds | Needed to train | Needed to embed |
+|---|---|---|---|---|
+| `x` | `[N', F]` | your features, scaled if `normalize=True` | **yes** — the model input | **yes** |
+| `pos` | `[N', P]` | the locations the search used, scaled the same way | only on the Nyström path (it slices subgraphs) | only on the Nyström path |
+| `pos_raw` | `[N', P]` | your locations exactly as passed, row-aligned with `pos` | no | no — carried for your own bookkeeping |
+| `edge_index` | `[2, E]` | `row 0` senders, `row 1` receivers, sorted by `(receiver, sender)` | **yes** | **yes** |
+| `edge_attr` | `[E, 2P + 1]` | the receiver's coordinates, the direction toward it, one relative distance | **yes** — the kernel input | **yes** |
+| `edge_dist` | `[E]` | edge length in the scaled space | no | no — the Nyström path recomputes it from `pos` if absent |
+| `affinity` | `[E]` | the loss target, summing to `1` over each receiver's incoming edges | **yes** on the dense path; the Nyström path recomputes it per subgraph | no |
+
+So **embedding needs only `x`, `edge_index` and `edge_attr`**; training additionally needs a target
+(`affinity`), and the Nyström path additionally needs `pos`. Drop a required field and the call fails
+immediately — `AttributeError` for `x`/`edge_attr`/`affinity`, `ValueError` from the loss for
+`edge_index` — rather than silently training on nothing.
 
 `N'` equals `N` unless you sampled. Two consequences worth knowing: `edge_attr` is `2P + 1` wide, so
 2-D locations give 5 columns and 3-D give 7 — that number is the model's `edge_channels`. And a node
