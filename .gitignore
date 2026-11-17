@@ -15,17 +15,10 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
-# Generated example plots
-examples/**/*.png
-examples/*.png
+# The examples are local-only: the ERA5 demo, the F3 seismic cube, their data and the marimo
+# notebooks are kept on the author's machine and are not published. `nofe` itself is `src/nofe/`;
+# nothing in the package or the test suite imports from here.
+examples/
 
-# Notebook execution artefacts
-examples/era5/notebooks/*.pt
-
-# ERA5 inputs for the notebooks: both dates (2018-01-01, 2019-08-01) are tracked, 21 MB each, so
-# the examples run from a fresh clone. The rule below is what would exclude them; keep it disabled.
-#examples/era5/data/*.nc
-
-# Seismic benchmark volumes: 1.2 GB of .npy, shipped as a downloadable package (see
-# examples/seismic/README.md). Only the example code is tracked.
-examples/seismic/data/**/*.npy
+# Notebook execution artefacts anywhere else
+**/__marimo__/

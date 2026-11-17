@@ -43,32 +43,30 @@ SSH key; with a token use `git+https://<token>@github.com/laueb4818/workshop-ski
 `uv` records the resolved commit in your `uv.lock`, so installs are reproducible until you run
 `uv lock --upgrade`. Put `@<commit-sha>` in the URL when you want that pin in `pyproject.toml`.
 
-This install has no `examples/` — that directory lives outside `src/`, so the ERA5 and F3 demos,
-their data and `examples/graph_utils.py` are not included. If you only want the package, that is the
-whole story.
+That is the whole install: `src/nofe/` is the package, and nothing in it depends on the examples.
 
-### The repository, examples included
+### The repository
 
-Clone and sync if you want the demos, their data, or a copy of the code to read:
+The repository holds the package, its tests and the tooling — **not** the worked examples, which are
+kept locally by the author. Clone and sync to read or change the code:
 
 ```bash
 git clone git@github.com:laueb4818/workshop-skibotn.git
 cd workshop-skibotn
-uv sync --all-groups --all-extras
+uv sync --all-groups
 ```
 
 Substitute the sync line for your platform:
 
 | Target | Command |
 |---|---|
-| any platform, CPU | `UV_TORCH_BACKEND=cpu uv sync --all-groups --all-extras` |
-| Linux x86_64 + NVIDIA | `UV_TORCH_BACKEND=cu128 uv sync --all-groups --all-extras` (also `cu126`, `cu130`) |
-| macOS arm64 | `uv sync --all-groups --all-extras` (Metal/MPS is enabled in the default macOS wheel) |
-| Windows AMD64 | `UV_TORCH_BACKEND=cpu uv sync --all-groups --all-extras` |
+| any platform, CPU | `UV_TORCH_BACKEND=cpu uv sync --all-groups` |
+| Linux x86_64 + NVIDIA | `UV_TORCH_BACKEND=cu128 uv sync --all-groups` (also `cu126`, `cu130`) |
+| macOS arm64 | `uv sync --all-groups` (Metal/MPS is enabled in the default macOS wheel) |
+| Windows AMD64 | `UV_TORCH_BACKEND=cpu uv sync --all-groups` |
 
-`--all-extras` is what pulls `cartopy`/`matplotlib`/`netCDF4` for the examples; the library itself
-needs none of them. Both ERA5 dates ship in the clone, so the ERA5 pipeline runs with no download
-step; the 1.2 GB F3 volume is not tracked and `examples/seismic/README.md` says where to put it.
+`--all-groups` installs the test and lint tools; the `examples` and `notebooks` extras exist for
+local example work and are not needed to use or develop the package.
 
 ### Editing `nofe` from another project
 
@@ -112,9 +110,9 @@ full of exact ties.
 Optional, and only a speed choice — the graphs are the same either way.
 
 ```bash
-uv sync --extra faiss          # installs faiss-cpu alongside the project
-uv run python tools/repair_faiss_omp.py   # link faiss's libomp at torch's (idempotent)
-NOFE_BACKEND=faiss uv run python examples/era5/scripts/era5.py
+uv sync --extra faiss                    # installs faiss-cpu alongside the project
+uv run python tools/repair_faiss_omp.py  # link faiss's libomp at torch's (idempotent)
+NOFE_BACKEND=faiss uv run python -c "import nofe; nofe.backend()"
 ```
 
 `tools/repair_faiss_omp.py` replaces `faiss/.dylibs/libomp.dylib` with a symlink to
@@ -131,10 +129,8 @@ missing rather than silently falling back.
 `PointGraph` is the single entry point: one node per feature row, at that row's location.
 
 ```python
-import numpy as np
-
 from nofe import PointGraph
-from nofe.search import RadiusIndex, sorted_pairs
+from nofe.search import radius_edges
 
 
 class RadiusGraph(PointGraph):
@@ -147,20 +143,19 @@ class RadiusGraph(PointGraph):
 
     def neighbour_pairs(self, points, radius, k):
         """(sender, receiver) ids: each row receives from every row within ``radius``."""
-        rows = np.arange(points.shape[0])
-        sender, receiver = RadiusIndex(points, rows).within(rows, radius)
-        return sorted_pairs(sender, receiver)
+        return radius_edges(points, radius)
 
 
 graph = RadiusGraph(radius=0.5).build(features, locations)
 ```
 
-`RadiusIndex`/`NearestIndex` (in `nofe.search`) are the backend-neutral searches: they pick faiss or
-cKDTree for you and return the same pairs on both. `examples/graph_utils.py` wraps them as
-`radius_edges`/`knn_edges`, which is what the two example subclasses call.
+`radius_edges` and its siblings (`knn_edges`, `raster_radius_edges`, `tiled_radius_edges`) are in
+`nofe.search`. They are backend-neutral — faiss where it works, cKDTree on macOS — and return the
+same pairs either way. `RadiusIndex` and `NearestIndex` are the lower-level objects underneath, for
+a restricted sender or receiver set.
 
 `features` and `locations` are any array-likes with one row per point — the same number of rows,
-`locations` in any dimension. `examples/` holds two full subclasses to copy from.
+`locations` in any dimension.
 
 The edge features are `[2P + 1]`-wide for `P` location dimensions. `build` returns a
 `torch_geometric.data.Data` with:
@@ -397,15 +392,10 @@ integrated terminal, the test runner and IntelliSense all use this project's int
 picker step. It is a per-workspace override: if the status bar shows another interpreter, run
 **Python: Select Interpreter** and choose `.venv/bin/python` once.
 
-`examples/` holds worked pipelines — the ERA5 demo and the F3 seismic cube, each with a
-`PointGraph` subclass in its `utilities/` directory and its notebooks. The examples need the
-`examples` extra, which pulls `cartopy`, `matplotlib` and `netCDF4`.
-
-The two ERA5 dates the demo and its notebooks use (`2018-01-01`, `2019-08-01`) are tracked in
-`examples/era5/data/`, 21 MB each, and that directory is the default data path, so the ERA5 pipeline
-runs from a fresh clone with no download step. `--data` (env `NOFE_ERA5_DATA`) points it at a
-different directory. The 1.2 GB F3 volume is not tracked; `examples/seismic/README.md` says where to
-put it.
+Worked examples — the ERA5 demo and the F3 seismic cube, each a `PointGraph` subclass plus a marimo
+notebook — are not published. They live in the author's local `examples/` directory, which
+`.gitignore` excludes. Nothing in `src/nofe/` or `tests/` imports from there, so the package and its
+suite are complete without them. The `examples` and `notebooks` extras stay for that local work.
 
 - The `examples` extra pins `netCDF4<1.7.5`: 1.7.5+ publishes only macOS 15 wheels, so macOS 14
   cannot install it. Its `cartopy` dependency downloads Natural Earth shapefiles on first use into
