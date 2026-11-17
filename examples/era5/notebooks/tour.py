@@ -10,17 +10,15 @@ def _():
 
     mo.md(
         """
-        # NOFE on ERA5: graph, model, inference
+        # Working with `nofe` on ERA5
 
-        A guided tour of the three things `nofe` does, run against real ERA5 fields:
+        Three steps, each with the same shape: build graphs, train on them, embed another one.
 
-        1. **Graph construction** — turn `(features, locations)` into the object the operator reads.
-        2. **Model and training** — `KernelNN` learns an embedding whose neighbourhoods match the
-           feature neighbourhoods.
-        3. **Inference** — take that trained model and embed a whole ERA5 file, then draw it.
+        1. **Training data** — several random subsets of *one* ERA5 file.
+        2. **Model and training** — `NOFE` fits one operator on all those subsets.
+        3. **Inference** — the whole, separate ERA5 file is embedded by that operator and drawn.
 
-        Each section states its inputs *before* the cell that runs it, so you can follow what goes
-        in and what comes out. Everything here is the real package; nothing is mocked.
+        The split by file is the point: the model never sees the inference date.
         """
     )
     return (mo,)
@@ -44,164 +42,175 @@ def _(mo):
     if _repo is None:
         raise RuntimeError(f"run this notebook from inside the nofe checkout, not {Path.cwd()}")
 
-    _era5_dir = _repo / "examples" / "era5"
-    DATA = _era5_dir / "data"
-    # The notebook imports the example's own helpers, so the loader and the globe plot have exactly
-    # one implementation in the repo rather than a copy that drifts.
-    sys.path.insert(0, str(_era5_dir / "scripts"))
-    sys.path.insert(0, str(_era5_dir / "utilities"))
+    _era5 = _repo / "examples" / "era5"
+    DATA = _era5 / "data"
+    # Import the example's own helpers, so the loader and the globe plot have exactly one
+    # implementation in the repo rather than a copy that drifts. `scripts/` must come first:
+    # `import era5` there is the plotting module, while `examples/era5` is the directory.
     sys.path.insert(0, str(_repo / "examples"))
+    sys.path.insert(0, str(_era5 / "utilities"))
+    sys.path.insert(0, str(_era5 / "scripts"))
 
     import era5  # noqa: E402
-    import numpy as np  # noqa: E402
     import torch  # noqa: E402
     from era5_graph import Era5Graph  # noqa: E402
 
     from nofe import NOFE, describe  # noqa: E402
 
     available = sorted(path.stem for path in DATA.glob("*.nc"))
+    if len(available) < 2:
+        raise RuntimeError(f"need two ERA5 dates in {DATA} to split training from inference")
+
+    mo.md(f"**Backend** `{describe()}` · **dates on disk** {', '.join(available)}")
+    return DATA, Era5Graph, NOFE, available, era5, mo, torch
+
+
+@app.cell
+def _(mo):
     mo.md(
-        f"**Repository** `{_repo.name}` · **backend** `{describe()}` · "
-        f"**dates on disk** {', '.join(f'`{d}`' for d in available) or 'none'}"
+        """
+        ## 1. Which file is which
+
+        Pick the training file; the *other* date becomes the inference field. The two are separate
+        days, so the model cannot have memorised the inference grid.
+        """
     )
-    return DATA, Era5Graph, NOFE, available, era5, mo, np, torch
+    return
 
 
 @app.cell
 def _(available, mo):
-    date = mo.ui.dropdown(options=available, value=available[0], label="ERA5 date")
-    stride = mo.ui.slider(2, 32, value=8, step=2, label="grid stride", show_value=True)
-    mo.vstack(
-        [
-            mo.md(
-                """
-                ## 0. Pick the data
-
-                `stride` thins the native 0.25° grid: stride 1 is 1,035,360 points, stride 8 is
-                16,020. Lower strides take longer to build and train; the lesson is the same.
-                """
-            ),
-            mo.hstack([date, stride], justify="start", gap=2),
-        ]
-    )
-    return date, stride
+    train_date = mo.ui.dropdown(options=available, value=available[0], label="training file")
+    mo.hstack([train_date], justify="start")
+    return (train_date,)
 
 
 @app.cell
-def _(DATA, Era5Graph, date, mo, stride):
-    builder = Era5Graph(radius=0.04363, stride=int(stride.value), data_dir=DATA)
-    features, latitudes, longitudes = builder.load(date.value)
-
+def _(available, mo, train_date):
+    # Read ``.value`` only here: a cell cannot resolve its own widget's value while creating it.
+    _infer = [date for date in available if date != train_date.value]
     mo.md(
-        f"""
-        ### 1a. The inputs to the graph builder
-
-        Every `PointGraph` needs exactly two arrays with one row per point:
-
-        | Input | What it is | Shape here |
-        |---|---|---|
-        | `features` | the values that describe each node | `{tuple(features.shape)}` |
-        | `locations` | where each node sits, any dim | `{latitudes.size} x {longitudes.size}` |
-
-        `features` is `lat x lon x variables`, and `locations` is one unit-sphere vector per grid
-        point, so `positions` turns the two axes into {latitudes.size * longitudes.size:,} rows.
-
-        `Era5Graph` is the subclass that supplies the neighbourhood rule: every grid point within
-        a chord of **{builder.radius}** on the unit sphere sends a message, banded by latitude so
-        even a fine grid stays buildable. Its own normalisation is off, because `load` has already
-        standardised each variable per field.
-        """
-    )
-    return builder, features, latitudes, longitudes
-
-
-@app.cell
-def _(mo):
-    mo.md(
-        """
-        ### 1b. Build it
-
-        The next cell calls `build(features, locations)`. In order, it: standardises both arrays per
-        column (skipped here), takes every row unless `sample=n`, searches for neighbours, sorts the
-        edges by `(receiver, sender)`, derives the geometric edge features, then computes the
-        affinities that will be the training target.
-        """
+        "| role | file | used for |\n|---|---|---|\n"
+        f"| **train** | `{train_date.value}` | random subsets, and only these |\n"
+        f"| **infer** | `{', '.join(_infer)}` | the whole field, never trained on |"
     )
     return
 
 
 @app.cell
-def _(builder, features, latitudes, longitudes, mo, torch):
-    # `build_raster` is the script's adapter and prints a summary; calling `build` directly keeps
-    # the notebook's own table as the only thing on screen.
-    _flat = features.reshape(-1, features.shape[2])
-    graph = builder.build(_flat, builder.positions(latitudes, longitudes))
+def _(available, train_date):
+    infer_date = next(d for d in available if d != train_date.value)
+    return (infer_date,)
 
-    _counts = torch.bincount(graph.edge_index[1], minlength=graph.num_nodes)
-    _isolated = int((_counts == 0).sum())
-    _degrees = _counts.float()
-    _edges = graph.edge_index.shape[1]
-    _pos_dims = graph.pos.shape[1]
+
+@app.cell
+def _(mo):
+    train_stride = mo.ui.slider(4, 16, value=8, step=4, label="training stride", show_value=True)
+    subsets = mo.ui.slider(1, 5, value=3, step=1, label="number of subsets", show_value=True)
+    subset_size = mo.ui.slider(
+        2_000, 16_000, value=8_000, step=2_000, label="points per subset", show_value=True
+    )
+    mo.vstack(
+        [
+            mo.md(
+                """
+                ## 2. Training data: random subsets of one file
+
+                Each subset is a random draw of `points per subset` grid points, with its own radius
+                neighbourhood. Training sees several of them as a *list*, which is how `nofe` covers
+                more of the domain than one graph would fit in memory.
+
+                The stride thins the grid before sampling; the radius follows from it, because the
+                neighbourhood has to stay the same physical size (`radius = 0.005454 x stride`, a
+                chord on the unit sphere).
+                """
+            ),
+            mo.hstack([train_stride, subsets, subset_size], justify="start", gap=2),
+        ]
+    )
+    return subset_size, subsets, train_stride
+
+
+@app.cell
+def _(DATA, Era5Graph, subset_size, subsets, train_date, train_stride):
+    # One builder per subset, each with its own seed, so the draws differ from each other and stay
+    # reproducible run to run.
+    stride = int(train_stride.value)
+    radius = 0.005454 * stride
+    builders = [
+        Era5Graph(
+            radius=radius,
+            stride=stride,
+            data_dir=DATA,
+            sample=int(subset_size.value),
+            seed=seed,
+        )
+        for seed in range(int(subsets.value))
+    ]
+    return builders, radius, stride
+
+
+@app.cell
+def _(builders, mo, train_date):
+    # The loader returns [lat, lon, variable] plus the two axes; `build` wants one row per point.
+    _template = builders[0]
+    train_features, train_lat, train_lon = _template.load(train_date.value)
+    _flat = train_features.reshape(-1, train_features.shape[2])
+
+    graphs = [builder.build(_flat, builder.positions(train_lat, train_lon)) for builder in builders]
+
+    _rows = "\n".join(
+        f"| {index} | {graph.num_nodes:,} | {graph.edge_index.shape[1]:,} |"
+        for index, graph in enumerate(graphs)
+    )
+    mo.vstack(
+        [
+            mo.md("### The training graphs"),
+            mo.md(
+                f"All subsets are drawn from the same {_flat.shape[0]:,}-point grid "
+                f"(`{train_features.shape[0]} x {train_features.shape[1]}`) with "
+                f"{train_features.shape[2]} variables per point:\n\n"
+                "| subset | nodes | edges |\n|---|---|---|\n" + _rows
+            ),
+        ]
+    )
+    return graphs, train_features, train_lat, train_lon
+
+
+@app.cell
+def _(graphs, mo, radius, torch):
+    _graph = graphs[0]
+    _counts = torch.bincount(_graph.edge_index[1], minlength=_graph.num_nodes)
+    _pos_dims = _graph.pos.shape[1]
 
     _fields = [
-        ("x", tuple(graph.x.shape), "features, one row per node (already standardised by `load`)"),
-        ("pos", tuple(graph.pos.shape), "the locations the search used"),
-        ("pos_raw", tuple(graph.pos_raw.shape), "the caller's own locations, row-aligned"),
-        ("edge_index", tuple(graph.edge_index.shape), "`row 0` senders, `row 1` receivers"),
-        ("edge_attr", tuple(graph.edge_attr.shape), "`[pos[receiver], direction, rel. distance]`"),
-        ("edge_dist", tuple(graph.edge_dist.shape), "edge length in the scaled space"),
-        ("affinity", tuple(graph.affinity.shape), "the loss target"),
+        ("x", _graph.x.shape, "features, one row per node"),
+        ("pos", _graph.pos.shape, "the locations the neighbour search used"),
+        ("pos_raw", _graph.pos_raw.shape, "the caller's own locations, row-aligned"),
+        ("edge_index", _graph.edge_index.shape, "`row 0` senders, `row 1` receivers"),
+        ("edge_attr", _graph.edge_attr.shape, "`[pos[receiver], direction, rel. distance]`"),
+        ("edge_dist", _graph.edge_dist.shape, "edge length in the scaled space"),
+        ("affinity", _graph.affinity.shape, "the training target"),
     ]
-    _table = "\n".join(f"| `{name}` | `{shape}` | {holds} |" for name, shape, holds in _fields)
+    _table = "\n".join(f"| `{n}` | `{tuple(s)}` | {h} |" for n, s, h in _fields)
 
     mo.vstack(
         [
+            mo.md("### What a training graph contains"),
             mo.md(
-                "### 1c. What the graph contains\n\n"
-                "| Field | Shape | Holds |\n|---|---|---|\n" + _table
+                f"Take subset 0 above. It has **{_graph.num_nodes:,} nodes** and "
+                f"**{_graph.edge_index.shape[1]:,} edges** ({float(_counts.float().mean()):.2f} "
+                f"incoming per node, radius {radius:.5f}):\n\n"
+                "| field | shape | holds |\n|---|---|---|\n" + _table
             ),
             mo.md(
-                f"""
-                Read the shapes as **{graph.num_nodes:,} nodes** and **{_edges:,} edges**, i.e.
-                {float(_degrees.mean()):.2f} incoming edges per node on average (max
-                {int(_counts.max())}).
-
-                `edge_attr` is `2P + 1 = {2 * _pos_dims + 1}` wide because the locations are
-                {_pos_dims}-D — that number becomes the model's `edge_channels`.
-
-                {_isolated:,} node(s) have no incoming edge: they get no `affinity` entry, so they
-                are excluded from the loss, but they are still embedded through the root weight.
-
-                `affinity` is not uniform — it is the student-t weight of each neighbour, normalised
-                per receiver, mean {float(graph.affinity.mean()):.4f}. That distribution is what the
-                embedding is trained to reproduce.
-                """
+                f"`edge_attr` is `2P + 1 = {2 * _pos_dims + 1}` wide because the locations are "
+                f"{_pos_dims}-D. `affinity` is the student-t weight of each neighbour normalised "
+                "per receiver: it is what the loss compares the embedding against, so it must "
+                "travel with the graph. `x`, `edge_index` and `edge_attr` are all the operator "
+                "itself reads."
             ),
         ]
-    )
-    return (graph,)
-
-
-@app.cell
-def _(graph, mo, torch):
-    # A concrete peek at a few edges beats another table: it shows the numbers the operator
-    # consumes, in the order `build` left them.
-    _head = torch.stack(
-        (
-            graph.edge_index[0][:6],
-            graph.edge_index[1][:6],
-            graph.affinity[:6],
-            graph.edge_dist[:6],
-        ),
-        dim=1,
-    )
-    _rows = "\n".join(
-        f"| {int(s)} | {int(r)} | {float(a):.4f} | {float(d):.4f} |"
-        for s, r, a, d in _head.tolist()
-    )
-    mo.md(
-        "**The first six edges.** Senders are sorted by receiver, so equal receivers are adjacent:"
-        "\n\n| sender | receiver | affinity | edge_dist |\n|---|---|---|---|\n" + _rows
     )
     return
 
@@ -210,22 +219,21 @@ def _(graph, mo, torch):
 def _(mo):
     mo.md(
         """
-        ## 2. The model
+        ## 3. The model
 
-        `KernelNN(out_dim=3, *, in_channels=None, edge_channels=None, width=32, ker_width=64,
-        depth=3, edge_batch_size=65536)`
+        `NOFE(out_dim=3, *, width, ker_width, depth, nystrom, chunk_size, device, seed, …)`
 
-        | Parameter | What it controls |
-        |---|---|
-        | `out_dim` | width of the embedding — 3 so we can draw it as RGB |
-        | `width` | hidden width; the dominant cost, since the kernel emits `width²` per edge |
-        | `ker_width` | hidden width of the edge-kernel MLP (edge features → `width × width`) |
-        | `depth` | message-passing hops; reuses **one** conv, so it adds no parameters |
-        | `in_channels` / `edge_channels` | left `None` here: taken from the first graph it sees |
-        | `edge_batch_size` | edges per kernel chunk; memory only, never the result |
+        `NOFE` owns a `KernelNN` as `.net` and runs the training loop. The two widths are left
+        unset here: they come from the first graph the model sees, so the graph does not have to be
+        described up front.
 
-        `NOFE` wraps that network as `.net` and adds the training loop. Below it gets
-        `nystrom=0.25`, the landmark approximation that keeps large graphs affordable.
+        | argument | here | why |
+        |---|---|---|
+        | `out_dim` | `3` | three numbers per node, so the map can be drawn as RGB |
+        | `width` | `8` | hidden width; peak memory grows as `edges x width²` |
+        | `ker_width` | `32` | hidden width of the edge-kernel MLP |
+        | `nystrom` | `0.25` | landmark approximation, so a subset stays cheap to fit |
+        | `chunk_size` | `65_536` | query rows per pass; memory only, never the result |
         """
     )
     return
@@ -234,22 +242,11 @@ def _(mo):
 @app.cell
 def _(NOFE, mo):
     model = NOFE(3, width=8, ker_width=32, nystrom=0.25, chunk_size=65_536)
-    _before = sum(p.numel() for p in model.net.parameters() if p.data.numel())
     mo.md(
-        f"""
-        ### 2a. Initialise it
-
-        The network exists as a real `torch` module before it has seen anything:
-
-        | | |
-        |---|---|
-        | `type(model.net)` | `{type(model.net).__name__}` |
-        | parameters counted so far | {_before:,} (the lazy ones are not materialised yet) |
-        | `in_channels` | not resolved yet |
-
-        Both widths resolve on the first forward pass, which is why the graph did not have to be
-        described to the constructor.
-        """
+        "### Initialise it\n\n"
+        f"`type(model.net)` is `{type(model.net).__name__}` — a real `torch` module, not a "
+        "wrapper. `in_channels` and `edge_channels` are not resolved yet; they appear after the "
+        "first forward pass."
     )
     return (model,)
 
@@ -258,128 +255,55 @@ def _(NOFE, mo):
 def _(mo):
     mo.md(
         """
-        ### 2b. Train it
+        ### Train on the list of subsets
 
-        `model.training(graph, epochs=…, seed=…)` returns one history per graph: one dict per
-        epoch, keyed `epoch` / `train_loss` / `val_loss` / `best_val_loss`. It keeps the epoch with
-        the best validation loss, so the weights you end up with are not simply the last ones.
-
-        Watch `in_channels` and `edge_channels` afterwards: they should read 11 and 7, matching the
-        graph's feature and edge widths.
+        `model.training(graphs, ...)` takes one graph or a list. With a list it returns **one
+        history per graph**, and an epoch is one optimizer step per graph. Passing the subsets as a
+        list is what makes this "train on several random samples" rather than "train on one".
         """
     )
     return
 
 
 @app.cell
-def _(graph, model, mo):
-    history = model.training(graph, epochs=80, patience=20, seed=0)
+def _(graphs, mo, model):
+    histories = model.training(graphs, epochs=40, patience=15, seed=0)
 
-    _last = history[-1]
-    _step = max(1, len(history) // 8)
-    _curve = "\n".join(
-        f"| {row['epoch']} | {row['train_loss']:.5f} | {row['val_loss']:.5f} |"
-        for row in history[::_step]
+    _last = histories[0][-1]
+    _rows = "\n".join(
+        f"| {index} | {len(history)} | {history[0]['train_loss']:.4f} | "
+        f"{history[-1]['train_loss']:.4f} |"
+        for index, history in enumerate(histories)
     )
     mo.vstack(
         [
-            mo.md("### 2c. Training ran"),
             mo.md(
-                "| | |\n|---|---|\n"
-                f"| epochs run | {len(history)} |\n"
-                f"| train loss, first → last | {history[0]['train_loss']:.5f} → "
-                f"{_last['train_loss']:.5f} |\n"
-                f"| best validation loss | {_last['best_val_loss']:.5f} |\n"
-                f"| resolved `in_channels` | {model.net.in_channels} |\n"
-                f"| resolved `edge_channels` | {model.net.edge_channels} |"
+                f"Trained on {len(graphs)} subset(s), {len(histories[0])} epochs each:\n\n"
+                "| subset | epochs | first train loss | last train loss |\n|---|---|---|---|\n"
+                + _rows
             ),
             mo.md(
-                "A sampled log of the curve:\n\n| epoch | train | val |\n|---|---|---|\n" + _curve
+                f"`model.net.in_channels` is now **{model.net.in_channels}** and "
+                f"`model.net.edge_channels` is **{model.net.edge_channels}** — the widths the "
+                "first graph settled. The next graph must match them, which is the only "
+                "requirement for embedding a different date."
             ),
         ]
     )
-    return (history,)
+    return (histories,)
 
 
 @app.cell
-def _(graph, model, mo):
-    embedding = model.embed(graph)
-    score = model.loss(graph)
-    mo.vstack(
-        [
-            mo.md(
-                f"""
-                ### 2d. Score the same graph
-
-                `embed` returns one row per node, in node order; `loss` re-reads the graph's
-                `affinity` and reports the mean KL of that embedding: **{score:.5f}**. Lower is
-                better, and the number is only meaningful next to a baseline — the next cell
-                supplies one.
-                """
-            ),
-            mo.md(
-                f"| | |\n|---|---|\n"
-                f"| `embedding` shape | `{tuple(embedding.shape)}` |\n"
-                f"| dtype / device | `{embedding.dtype}` / `{embedding.device.type}` |"
-            ),
-        ]
-    )
-    return (embedding,)
-
-
-@app.cell
-def _(embedding, graph, mo, np, torch):
-    # PCA-3 is the honest reference: the best *linear* map to 3 dimensions. A useful embedding beats
-    # it on the same objective.
-    from nofe.affinity import affinity_kl_loss
-
-    _centred = graph.x - graph.x.mean(dim=0, keepdim=True)
-    _, _, _basis = torch.linalg.svd(_centred, full_matrices=False)
-    _reference = _centred @ _basis[:3].T
-    _model_kl = float(affinity_kl_loss(graph.x, embedding, graph.edge_index, graph.num_nodes))
-    _reference_kl = float(affinity_kl_loss(graph.x, _reference, graph.edge_index, graph.num_nodes))
-    _spread = embedding.detach().cpu().numpy().std(axis=0)
-    _verdict = (
-        "NOFE beats the linear baseline."
-        if _model_kl < _reference_kl
-        else "NOFE did not beat the baseline here — train longer or raise the stride."
-    )
-
-    mo.vstack(
-        [
-            mo.md("### 2e. Is it any good?"),
-            mo.md(
-                "| map to 3-D | mean KL |\n|---|---|\n"
-                f"| best linear projection (PCA) | {_reference_kl:.5f} |\n"
-                f"| NOFE | {_model_kl:.5f} |"
-            ),
-            mo.md(
-                f"{_verdict}\n\n"
-                f"The embedding spans {', '.join(f'{float(v):.3f}' for v in _spread)} per "
-                "channel, so no channel collapsed.\n\n"
-                f"Both numbers score the *same* embedding function on the same graph, so they are "
-                f"comparable. This one ({_model_kl:.5f}) is higher than the `loss` above because "
-                "`embed` runs the Nyström approximation — a subset of landmarks — while `loss` "
-                "scores the model's own training path."
-            ),
-        ]
-    )
-    return
-
-
-@app.cell
-def _(mo):
+def _(infer_date, mo, train_date):
     mo.md(
-        """
-        ## 3. Inference on a whole ERA5 file
+        f"""
+        ## 4. Inference on the other file
 
-        The trained operator never saw `pos` or `affinity`, only features and edges. That is what
-        makes this step possible: point it at a **different, finer** grid and it embeds that one
-        instead.
+        Training used subsets of **`{train_date.value}`**. This section embeds **`{infer_date}`**,
+        whole: a date the model has never seen, with its own features and its own edges.
 
-        Below, the same model embeds the field at native resolution. The graph is built exactly as
-        before — same class, same radius-to-stride relationship — and then drawn one quad per grid
-        point, R/G/B from the three embedding dimensions.
+        Nothing is re-fitted here. `embed` reads `x`, `edge_index` and `edge_attr` from whatever
+        graph it is handed, so the only compatibility requirement is the two widths.
         """
     )
     return
@@ -388,15 +312,19 @@ def _(mo):
 @app.cell
 def _(mo):
     infer_stride = mo.ui.slider(
-        1, 8, value=4, step=1, label="inference stride (1 = native resolution)", show_value=True
+        1, 8, value=2, step=1, label="inference stride (1 = the full file)", show_value=True
     )
     mo.vstack(
         [
             mo.md(
                 """
-                Pick how fine the inference grid should be. Stride 1 is the full file: 1,035,360
-                nodes and ~22M edges, which is a lot to build inside a notebook. Stride 4 is a good
-                live-demo default; drop it to 1 to show the real thing.
+                The inference stride is independent of the training stride: this is how fine the
+                map is drawn. Stride 1 builds the whole 1,035,360-point field (~22M edges), which
+                takes a while inside a notebook; stride 2 is a good default and stride 1 shows the
+                full resolution.
+
+                The radius scales with it for the same reason as before, so the neighbourhood stays
+                physically the same size as the training one.
                 """
             ),
             infer_stride,
@@ -406,62 +334,58 @@ def _(mo):
 
 
 @app.cell
-def _(DATA, Era5Graph, date, infer_stride, mo, model, np):
-    # The radius has to shrink with the stride so the neighbourhood stays physically the same; these
-    # are the constants `examples/era5/scripts/era5.py` uses.
-    _chords = {1: 0.005454, 2: 0.011, 4: 0.0218, 8: 0.04363}
-    _radius = _chords.get(int(infer_stride.value), 0.04363)
-    infer_builder = Era5Graph(radius=_radius, stride=int(infer_stride.value), data_dir=DATA)
-    infer_features, infer_lat, infer_lon = infer_builder.load(date.value)
+def _(DATA, Era5Graph, infer_date, infer_stride, mo, model, torch):
+    infer_radius = 0.005454 * int(infer_stride.value)
+    infer_builder = Era5Graph(radius=infer_radius, stride=int(infer_stride.value), data_dir=DATA)
+    infer_features, infer_lat, infer_lon = infer_builder.load(infer_date)
     infer_graph = infer_builder.build(
         infer_features.reshape(-1, infer_features.shape[2]),
         infer_builder.positions(infer_lat, infer_lon),
     )
     infer_embedding = model.embed(infer_graph).numpy()
 
-    _finite = bool(np.isfinite(infer_embedding).all())
+    _finite = bool(torch.isfinite(torch.as_tensor(infer_embedding)).all())
     mo.md(
         f"""
-        ### 3a. The inference graph
+        ### The inference graph and its embedding
 
         | | |
         |---|---|
+        | date | `{infer_date}` |
         | nodes | {infer_graph.num_nodes:,} |
         | edges | {infer_graph.edge_index.shape[1]:,} |
-        | `x` width | {infer_graph.x.shape[1]} (same features as training) |
+        | `x` width | {infer_graph.x.shape[1]} (same as training) |
         | `edge_attr` width | {infer_graph.edge_attr.shape[1]} (same `2P + 1`) |
-        | embedding | `{tuple(infer_embedding.shape)}`, all finite: {_finite} |
-
-        Matching widths is the only requirement, and the operator satisfies it because it learns a
-        *function of local neighbourhoods* rather than a lookup table of nodes.
+        | embedding | `{tuple(infer_embedding.shape)}`, one row per node, all finite: {_finite} |
         """
     )
-    return infer_embedding, infer_lat, infer_lon
+    return infer_embedding, infer_graph, infer_lat, infer_lon
 
 
 @app.cell
-def _(era5, infer_embedding, infer_lat, infer_lon, mo):
+def _(era5, infer_date, infer_embedding, infer_lat, infer_lon, mo):
     _figure = era5.globe_figure(
-        infer_lat, infer_lon, infer_embedding, "Inference on the ERA5 field"
+        infer_lat, infer_lon, infer_embedding, f"{infer_date}: embedded by the trained operator"
     )
     mo.as_html(_figure)
     return
 
 
 @app.cell
-def _(infer_embedding, mo):
-    _spread = infer_embedding.std(axis=0)
-    _channels = ", ".join(f"{value:.3f}" for value in _spread)
+def _(infer_date, infer_graph, infer_stride, mo, train_date):
     mo.md(
         f"""
-        ### 3b. Reading the map
+        ### Summary
 
-        R/G/B are the three embedding dimensions, each scaled by its 5th–95th percentile so one
-        cyclone cannot flatten the field to grey. Per-channel spread is {_channels} — three live
-        channels, so the map has real colour structure rather than a grey wash.
+        | step | call | data |
+        |---|---|---|
+        | build | `builder.build(features, locations)` | subsets of `{train_date.value}` |
+        | train | `model.training(graphs, ...)` | that list of subsets |
+        | embed | `model.embed(graph)` | all of `{infer_date}`, stride {int(infer_stride.value)} |
 
-        The point of the tour: one graph builder, one small model, and the same three calls
-        (`build` → `training` → `embed`) scale from a 16k-node teaching example to a million nodes.
+        That is the whole workflow: one graph builder subclass, one `NOFE`, and `training` /
+        `embed` for the two directions. `model.net.state_dict()` is the checkpoint if you want to
+        keep the fitted operator.
         """
     )
     return
