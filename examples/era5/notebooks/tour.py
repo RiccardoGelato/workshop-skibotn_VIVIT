@@ -62,19 +62,17 @@ def _(mo):
         raise RuntimeError(f"need two ERA5 dates in {DATA} to split training from inference")
 
     mo.md(f"**Backend** `{describe()}` · **dates on disk** {', '.join(available)}")
-    return DATA, Era5Graph, NOFE, available, era5, mo, torch
+    return DATA, Era5Graph, NOFE, available, era5, torch
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ## 1. Which file is which
+    mo.md("""
+    ## 1. Which file is which
 
-        Pick the training file; the *other* date becomes the inference field. The two are separate
-        days, so the model cannot have memorised the inference grid.
-        """
-    )
+    Pick the training file; the *other* date becomes the inference field. The two are separate
+    days, so the model cannot have memorised the inference grid.
+    """)
     return
 
 
@@ -87,19 +85,13 @@ def _(available, mo):
 
 @app.cell
 def _(available, mo, train_date):
-    # Read ``.value`` only here: a cell cannot resolve its own widget's value while creating it.
-    _infer = [date for date in available if date != train_date.value]
+    # Read `.value` only here: a cell cannot resolve its own widget's value while creating it.
+    infer_date = next(date for date in available if date != train_date.value)
     mo.md(
         "| role | file | used for |\n|---|---|---|\n"
         f"| **train** | `{train_date.value}` | random subsets, and only these |\n"
-        f"| **infer** | `{', '.join(_infer)}` | the whole field, never trained on |"
+        f"| **infer** | `{infer_date}` | the whole field, never trained on |"
     )
-    return
-
-
-@app.cell
-def _(available, train_date):
-    infer_date = next(d for d in available if d != train_date.value)
     return (infer_date,)
 
 
@@ -132,31 +124,21 @@ def _(mo):
 
 
 @app.cell
-def _(DATA, Era5Graph, subset_size, subsets, train_date, train_stride):
+def _(DATA, Era5Graph, mo, subset_size, subsets, train_date, train_stride):
     # One builder per subset, each with its own seed, so the draws differ from each other and stay
     # reproducible run to run.
     stride = int(train_stride.value)
     radius = 0.005454 * stride
     builders = [
         Era5Graph(
-            radius=radius,
-            stride=stride,
-            data_dir=DATA,
-            sample=int(subset_size.value),
-            seed=seed,
+            radius=radius, stride=stride, data_dir=DATA, sample=int(subset_size.value), seed=seed
         )
         for seed in range(int(subsets.value))
     ]
-    return builders, radius, stride
 
-
-@app.cell
-def _(builders, mo, train_date):
     # The loader returns [lat, lon, variable] plus the two axes; `build` wants one row per point.
-    _template = builders[0]
-    train_features, train_lat, train_lon = _template.load(train_date.value)
+    train_features, train_lat, train_lon = builders[0].load(train_date.value)
     _flat = train_features.reshape(-1, train_features.shape[2])
-
     graphs = [builder.build(_flat, builder.positions(train_lat, train_lon)) for builder in builders]
 
     _rows = "\n".join(
@@ -167,14 +149,16 @@ def _(builders, mo, train_date):
         [
             mo.md("### The training graphs"),
             mo.md(
-                f"All subsets are drawn from the same {_flat.shape[0]:,}-point grid "
-                f"(`{train_features.shape[0]} x {train_features.shape[1]}`) with "
-                f"{train_features.shape[2]} variables per point:\n\n"
+                f"`Era5Graph(radius={radius:.5f}, stride={stride}, "
+                f"sample={int(subset_size.value):,})`, one builder per subset with its own seed. "
+                f"All draws come from the same {_flat.shape[0]:,}-point grid "
+                f"(`{train_features.shape[0]} x {train_features.shape[1]}`, "
+                f"{train_features.shape[2]} variables per point):\n\n"
                 "| subset | nodes | edges |\n|---|---|---|\n" + _rows
             ),
         ]
     )
-    return graphs, train_features, train_lat, train_lon
+    return graphs, radius
 
 
 @app.cell
@@ -216,60 +200,35 @@ def _(graphs, mo, radius, torch):
 
 
 @app.cell
-def _(mo):
-    mo.md(
-        """
-        ## 3. The model
-
-        `NOFE(out_dim=3, *, width, ker_width, depth, nystrom, chunk_size, device, seed, …)`
-
-        `NOFE` owns a `KernelNN` as `.net` and runs the training loop. The two widths are left
-        unset here: they come from the first graph the model sees, so the graph does not have to be
-        described up front.
-
-        | argument | here | why |
-        |---|---|---|
-        | `out_dim` | `3` | three numbers per node, so the map can be drawn as RGB |
-        | `width` | `8` | hidden width; peak memory grows as `edges x width²` |
-        | `ker_width` | `32` | hidden width of the edge-kernel MLP |
-        | `nystrom` | `0.25` | landmark approximation, so a subset stays cheap to fit |
-        | `chunk_size` | `65_536` | query rows per pass; memory only, never the result |
-        """
-    )
-    return
-
-
-@app.cell
 def _(NOFE, mo):
     model = NOFE(3, width=8, ker_width=32, nystrom=0.25, chunk_size=65_536)
-    mo.md(
-        "### Initialise it\n\n"
-        f"`type(model.net)` is `{type(model.net).__name__}` — a real `torch` module, not a "
-        "wrapper. `in_channels` and `edge_channels` are not resolved yet; they appear after the "
-        "first forward pass."
+    mo.vstack(
+        [
+            mo.md(
+                "## 3. The model\n\n"
+                f"`type(model.net)` is `{type(model.net).__name__}` — a real `torch` module. "
+                "`in_channels` and `edge_channels` are not resolved yet; they come from the first "
+                "graph the model sees, so the graph need not be described up front."
+            ),
+            mo.md(
+                "| argument | here | why |\n|---|---|---|\n"
+                "| `out_dim` | `3` | three numbers per node, so the map can be drawn as RGB |\n"
+                "| `width` | `8` | hidden width; peak memory grows as `edges x width²` |\n"
+                "| `ker_width` | `32` | hidden width of the edge-kernel MLP |\n"
+                "| `nystrom` | `0.25` | landmark approximation, so a subset stays cheap to fit |\n"
+                "| `chunk_size` | `65_536` | query rows per pass; memory only, never the result |"
+            ),
+        ]
     )
     return (model,)
 
 
 @app.cell
-def _(mo):
-    mo.md(
-        """
-        ### Train on the list of subsets
-
-        `model.training(graphs, ...)` takes one graph or a list. With a list it returns **one
-        history per graph**, and an epoch is one optimizer step per graph. Passing the subsets as a
-        list is what makes this "train on several random samples" rather than "train on one".
-        """
-    )
-    return
-
-
-@app.cell
 def _(graphs, mo, model):
+    # One graph or a list: a list returns one history per graph, and an epoch is one optimizer step
+    # per graph. That is what makes this "train on several random samples" rather than on one.
     histories = model.training(graphs, epochs=40, patience=15, seed=0)
 
-    _last = histories[0][-1]
     _rows = "\n".join(
         f"| {index} | {len(history)} | {history[0]['train_loss']:.4f} | "
         f"{history[-1]['train_loss']:.4f} |"
@@ -277,8 +236,10 @@ def _(graphs, mo, model):
     )
     mo.vstack(
         [
+            mo.md("### Train on the list of subsets"),
             mo.md(
-                f"Trained on {len(graphs)} subset(s), {len(histories[0])} epochs each:\n\n"
+                f"`model.training(graphs, ...)` trained on {len(graphs)} subset(s), "
+                f"{len(histories[0])} epochs each:\n\n"
                 "| subset | epochs | first train loss | last train loss |\n|---|---|---|---|\n"
                 + _rows
             ),
@@ -290,44 +251,30 @@ def _(graphs, mo, model):
             ),
         ]
     )
-    return (histories,)
-
-
-@app.cell
-def _(infer_date, mo, train_date):
-    mo.md(
-        f"""
-        ## 4. Inference on the other file
-
-        Training used subsets of **`{train_date.value}`**. This section embeds **`{infer_date}`**,
-        whole: a date the model has never seen, with its own features and its own edges.
-
-        Nothing is re-fitted here. `embed` reads `x`, `edge_index` and `edge_attr` from whatever
-        graph it is handed, so the only compatibility requirement is the two widths.
-        """
-    )
     return
 
 
 @app.cell
-def _(mo):
+def _(infer_date, mo, train_date):
     infer_stride = mo.ui.slider(
         1, 8, value=2, step=1, label="inference stride (1 = the full file)", show_value=True
     )
     mo.vstack(
         [
             mo.md(
-                """
-                The inference stride is independent of the training stride: this is how fine the
-                map is drawn. Stride 1 builds the whole 1,035,360-point field (~22M edges), which
-                takes a while inside a notebook; stride 2 is a good default and stride 1 shows the
-                full resolution.
-
-                The radius scales with it for the same reason as before, so the neighbourhood stays
-                physically the same size as the training one.
-                """
+                f"## 4. Inference on the other file\n\n"
+                f"Training used subsets of **`{train_date.value}`**. This section embeds "
+                f"**`{infer_date}`**, whole: a date the model has never seen, with its own "
+                "features and its own edges. Nothing is re-fitted — `embed` reads `x`, "
+                "`edge_index` and `edge_attr` from whatever graph it is handed."
             ),
-            infer_stride,
+            mo.md(
+                "The stride here is independent of the training stride: it sets how fine the map "
+                "is drawn. Stride 1 is the whole 1,035,360-point field (~22M edges), which takes a "
+                "while in a notebook; stride 2 is the default. The radius scales with it, keeping "
+                "the neighbourhood the same physical size as in training."
+            ),
+            mo.hstack([infer_stride], justify="start"),
         ]
     )
     return (infer_stride,)
@@ -359,7 +306,7 @@ def _(DATA, Era5Graph, infer_date, infer_stride, mo, model, torch):
         | embedding | `{tuple(infer_embedding.shape)}`, one row per node, all finite: {_finite} |
         """
     )
-    return infer_embedding, infer_graph, infer_lat, infer_lon
+    return infer_embedding, infer_lat, infer_lon
 
 
 @app.cell
@@ -372,22 +319,20 @@ def _(era5, infer_date, infer_embedding, infer_lat, infer_lon, mo):
 
 
 @app.cell
-def _(infer_date, infer_graph, infer_stride, mo, train_date):
-    mo.md(
-        f"""
-        ### Summary
+def _(infer_date, infer_stride, mo, train_date):
+    mo.md(f"""
+    ### Summary
 
-        | step | call | data |
-        |---|---|---|
-        | build | `builder.build(features, locations)` | subsets of `{train_date.value}` |
-        | train | `model.training(graphs, ...)` | that list of subsets |
-        | embed | `model.embed(graph)` | all of `{infer_date}`, stride {int(infer_stride.value)} |
+    | step | call | data |
+    |---|---|---|
+    | build | `builder.build(features, locations)` | subsets of `{train_date.value}` |
+    | train | `model.training(graphs, ...)` | that list of subsets |
+    | embed | `model.embed(graph)` | all of `{infer_date}`, stride {int(infer_stride.value)} |
 
-        That is the whole workflow: one graph builder subclass, one `NOFE`, and `training` /
-        `embed` for the two directions. `model.net.state_dict()` is the checkpoint if you want to
-        keep the fitted operator.
-        """
-    )
+    That is the whole workflow: one graph builder subclass, one `NOFE`, and `training` /
+    `embed` for the two directions. `model.net.state_dict()` is the checkpoint if you want to
+    keep the fitted operator.
+    """)
     return
 
 
