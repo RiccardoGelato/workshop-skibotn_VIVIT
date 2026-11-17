@@ -175,10 +175,148 @@ class NearestIndex(_Index):
         return bool((squared[:, -1] == squared[:, -2]).any())
 
 
+def _as_points(pos, name: str = "pos") -> np.ndarray:
+    """``pos`` as a contiguous float32 2-D array, ``ValueError`` if it is not 2-D."""
+    if hasattr(pos, "detach"):
+        pos = pos.detach().cpu().numpy()
+    points = np.asarray(pos, dtype=np.float32)
+    if points.ndim != 2:
+        raise ValueError(f"{name} must be 2-D [num_nodes, dims], got shape {points.shape}")
+    return np.ascontiguousarray(points)
+
+
+def _pairs(
+    points: np.ndarray,
+    sources: np.ndarray,
+    targets: np.ndarray,
+    *,
+    radius: float | None = None,
+    k: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(sender, receiver)`` global ids, self hits excluded."""
+    if sources.size == 0 or targets.size == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    if radius is not None:
+        sender, receiver = RadiusIndex(points, sources).within(targets, float(radius))
+        return sorted_pairs(sender, receiver)
+    assert k is not None
+    return NearestIndex(points, sources).nearest(targets, int(k))
+
+
+def _edges(
+    pos,
+    *,
+    sources: np.ndarray | None = None,
+    targets: np.ndarray | None = None,
+    radius: float | None = None,
+    k: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(sender, receiver)`` int64 arrays sorted by ``(receiver, sender)``."""
+    points = _as_points(pos)
+    every = np.arange(points.shape[0], dtype=np.int64)
+    src = every if sources is None else np.asarray(sources, dtype=np.int64)
+    dst = every if targets is None else np.asarray(targets, dtype=np.int64)
+    sender, receiver = _pairs(points, src, dst, radius=radius, k=k)
+    return sorted_pairs(sender, receiver)
+
+
+def radius_edges(
+    pos,
+    radius: float,
+    *,
+    sources=None,
+    targets=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Radius neighbourhood over ``pos``: ``(sender, receiver)``, senders from ``sources``.
+
+    A point at exactly ``radius`` is excluded, matching faiss's boundary rule, and the two backends
+    agree edge for edge — see :mod:`nofe.backend`.
+    """
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+    return _edges(pos, sources=sources, targets=targets, radius=float(radius))
+
+
+def tiled_radius_edges(
+    pos,
+    radius: float,
+    *,
+    rows: int,
+    cols: int,
+    band: int = 32,
+    halo: int = 6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Radius pairs for a ``rows x cols`` raster, searched one band of rows at a time.
+
+    ``pos`` is row-major over the raster (``index = row * cols + col``). Band ``b``'s queries are
+    matched only against rows ``b`` +/- ``halo``, which is exact for any radius that cannot span
+    more than ``halo`` rows. Longitude needs no halo: every row keeps all ``cols`` columns.
+
+    This is an optimisation for full rasters; the pairs are identical to :func:`radius_edges`.
+    """
+    values = _as_points(pos)
+    if rows * cols != values.shape[0]:
+        raise ValueError(
+            f"rows * cols = {rows * cols} must match the {values.shape[0]} points of a "
+            f"{rows} x {cols} raster"
+        )
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+
+    sender_parts: list[np.ndarray] = []
+    receiver_parts: list[np.ndarray] = []
+    for start in range(0, rows, band):
+        stop = min(start + band, rows)
+        lo = max(0, start - halo)
+        hi = min(rows, stop + halo)
+        index = RadiusIndex(values, np.arange(lo * cols, hi * cols))
+        sender, receiver = index.within(np.arange(start * cols, stop * cols), radius)
+        sender_parts.append(sender)
+        receiver_parts.append(receiver)
+
+    empty = np.zeros(0, dtype=np.int64)
+    if not sender_parts:
+        return empty, empty.copy()
+    sender = np.concatenate(sender_parts)
+    receiver = np.concatenate(receiver_parts)
+    if sender.size == 0:
+        return empty, empty.copy()
+    # Sorted across all bands, so the banding leaves no trace in the output.
+    return sorted_pairs(sender, receiver)
+
+
+def raster_radius_edges(pos, radius: float, *, rows: int, cols: int):
+    """Radius pairs for a complete ``rows x cols`` raster, via :func:`tiled_radius_edges`."""
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+    return tiled_radius_edges(pos, radius, rows=rows, cols=cols)
+
+
+def knn_edges(
+    pos,
+    k: int,
+    *,
+    sources=None,
+    targets=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """k-nearest-neighbour graph over ``pos``: ``(sender, receiver)``, senders from ``sources``."""
+    if k < 1:
+        raise ValueError(f"k must be at least 1, got {k}")
+    return _edges(pos, sources=sources, targets=targets, k=int(k))
+
+
 def sorted_pairs(sender: np.ndarray, receiver: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """``(sender, receiver)`` sorted by ``(receiver, sender)``: deterministic edge order."""
     order = np.lexsort((sender, receiver))
     return sender[order].astype(np.int64), receiver[order].astype(np.int64)
 
 
-__all__ = ["NearestIndex", "RadiusIndex", "sorted_pairs"]
+__all__ = [
+    "NearestIndex",
+    "RadiusIndex",
+    "knn_edges",
+    "radius_edges",
+    "raster_radius_edges",
+    "sorted_pairs",
+    "tiled_radius_edges",
+]

@@ -8,24 +8,19 @@ trains on. These tests pin the equivalence, including the two places where a nai
 - k-NN ties, where equal distances must resolve by the same index order.
 """
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-
-from graph_utils import (  # noqa: E402
+from nofe.backend import backend  # noqa: E402
+from nofe.search import (  # noqa: E402
+    NearestIndex,
+    RadiusIndex,
     knn_edges,
     radius_edges,
     raster_radius_edges,
     tiled_radius_edges,
 )
-
-from nofe.backend import backend  # noqa: E402
-from nofe.search import NearestIndex, RadiusIndex  # noqa: E402
 
 
 def _faiss_usable() -> bool:

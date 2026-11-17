@@ -1,15 +1,9 @@
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-
-from graph_utils import radius_edges  # noqa: E402
-
 from nofe import PointGraph  # noqa: E402
+from nofe.search import radius_edges
 
 
 class NnGraph(PointGraph):
