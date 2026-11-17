@@ -56,8 +56,10 @@ def _(mo):
     sys.path.insert(0, str(_era5 / "scripts"))
 
     import era5  # noqa: E402
+    import matplotlib.pyplot as plt  # noqa: E402
+    import numpy as np  # noqa: E402
     import torch  # noqa: E402
-    from era5_graph import Era5Graph  # noqa: E402
+    from era5_graph import VARIABLES, Era5Graph  # noqa: E402
 
     from nofe import NOFE, describe  # noqa: E402
 
@@ -66,19 +68,17 @@ def _(mo):
         raise RuntimeError(f"need two ERA5 dates in {DATA} to split training from inference")
 
     mo.md(f"**Backend** `{describe()}` · **dates on disk** {', '.join(available)}")
-    return DATA, Era5Graph, NOFE, available, era5, torch
+    return DATA, Era5Graph, NOFE, VARIABLES, available, era5, np, plt, torch
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ## 1. Which file is which
+    mo.md("""
+    ## 1. Which file is which
 
-        The dropdown picks the training file; the *other* date becomes the inference field. Two
-        separate days, so the model cannot have memorised the inference grid.
-        """
-    )
+    The dropdown picks the training file; the *other* date becomes the inference field. Two
+    separate days, so the model cannot have memorised the inference grid.
+    """)
     return
 
 
@@ -143,7 +143,7 @@ def _(DATA, Era5Graph, mo, subset_size, subsets, train_stride):
         f"at radius {radius:.5f}"
     )
     mo.show_code(_sample_summary, position="above")
-    return builders, radius, stride
+    return builders, radius
 
 
 @app.cell
@@ -226,18 +226,26 @@ def _(NOFE, mo):
 
 
 @app.cell
-def _(model, mo):
-    mo.md(
-        "| argument | here | why |\n|---|---|---|\n"
-        "| `out_dim` | `3` | three numbers per node, so the map can be drawn as RGB |\n"
-        "| `width` | `8` | hidden width; peak memory grows as `edges x width²` |\n"
-        "| `ker_width` | `32` | hidden width of the edge-kernel MLP |\n"
-        "| `nystrom` | `0.25` | landmark approximation, so a subset stays cheap to fit |\n"
-        "| `chunk_size` | `65_536` | query rows per pass; memory only, never the result |\n\n"
+def _(mo):
+    mo.md("""
+    | argument | here | why |
+    |---|---|---|
+    "
+        "| `out_dim` | `3` | three numbers per node, so the map can be drawn as RGB |
+    "
+        "| `width` | `8` | hidden width; peak memory grows as `edges x width²` |
+    "
+        "| `ker_width` | `32` | hidden width of the edge-kernel MLP |
+    "
+        "| `nystrom` | `0.25` | landmark approximation, so a subset stays cheap to fit |
+    "
+        "| `chunk_size` | `65_536` | query rows per pass; memory only, never the result |
+
+    "
         "`NOFE` owns that network as `.net` and runs the training loop. It is not itself an "
         "`nn.Module` — `nn.Module` owns the attribute `training`, so a trainer method of that "
-        "name has to live elsewhere."
-    )
+        "name has to live elsewhere.
+    """)
     return
 
 
@@ -255,7 +263,7 @@ def _(graphs, mo, model):
 
 
 @app.cell
-def _(graphs, histories, mo, model):
+def _(histories, mo, model):
     _rows_1 = "\n".join(
         f"| {index} | {len(history)} | {history[0]['train_loss']:.4f} | "
         f"{history[-1]['train_loss']:.4f} |"
@@ -321,7 +329,7 @@ def _(DATA, Era5Graph, infer_date, infer_stride, mo):
         f"**{infer_graph.edge_index.shape[1]:,} edges** from `{infer_date}`"
     )
     mo.show_code(_infer_build_summary, position="above")
-    return infer_graph, infer_lat, infer_lon
+    return infer_features, infer_graph, infer_lat, infer_lon
 
 
 @app.cell
@@ -336,9 +344,9 @@ def _(infer_graph, mo, model, torch):
 
 
 @app.cell
-def _(infer_date, infer_graph, infer_embedding, mo, model):
+def _(infer_date, infer_embedding, infer_graph, mo):
     mo.md(
-        f"| | |\n|---|---|\n"
+        "| | |\n|---|---|\n"
         f"| date | `{infer_date}` |\n"
         f"| nodes / edges | {infer_graph.num_nodes:,} / "
         f"{infer_graph.edge_index.shape[1]:,} |\n"
@@ -346,6 +354,42 @@ def _(infer_date, infer_graph, infer_embedding, mo, model):
         f"| `edge_attr` width | {infer_graph.edge_attr.shape[1]} (same `2P + 1`) |\n"
         f"| embedding | `{tuple(infer_embedding.shape)}` |"
     )
+    return
+
+
+@app.cell
+def _(VARIABLES, infer_date, infer_features, infer_lat, infer_lon, mo, np, plt):
+    # One small panel per input variable, so the audience can see what the operator was given.
+    # `infer_features` is [lat, lon, variable]; a panel is the field of one variable.
+    _num = len(VARIABLES)
+    _cols = 4
+    _rows = int(np.ceil(_num / _cols))
+    _figure, _axes = plt.subplots(
+        _rows, _cols, figsize=(3.2 * _cols, 2.1 * _rows), constrained_layout=True
+    )
+    _axes = np.atleast_1d(_axes).ravel()
+    for _axis, (_index, _name) in zip(_axes, enumerate(VARIABLES), strict=False):
+        _data = infer_features[:, :, _index]
+        # Symmetric 2nd/98th percentile limits: `w` and `d` are mostly noise around zero with a
+        # few outliers, so a max-abs scale would flatten them to a blank panel.
+        _limit = float(np.percentile(np.abs(_data), 98)) or 1.0
+        _image = _axis.pcolormesh(
+            infer_lon,
+            infer_lat,
+            _data,
+            shading="nearest",
+            cmap="RdBu_r",
+            vmin=-_limit,
+            vmax=_limit,
+        )
+        _axis.set_title(_name, fontsize=9)
+        _axis.set_xticks([])
+        _axis.set_yticks([])
+        _figure.colorbar(_image, ax=_axis, fraction=0.046, pad=0.02)
+    for _axis in _axes[_num:]:
+        _axis.set_visible(False)
+    _figure.suptitle(f"{infer_date}: the {_num} input variables the operator receives")
+    mo.vstack([mo.md("### The input variables"), mo.as_html(_figure)])
     return
 
 
@@ -360,21 +404,19 @@ def _(era5, infer_date, infer_embedding, infer_lat, infer_lon, mo):
 
 @app.cell
 def _(infer_date, infer_stride, mo, train_date):
-    mo.md(
-        f"""
-        ### Summary
+    mo.md(f"""
+    ### Summary
 
-        | step | call | data |
-        |---|---|---|
-        | sample | `Era5Graph(..., sample=N)` | `{train_date.value}` |
-        | build | `builder.build(features, locations)` | the same subsets |
-        | train | `model.training(graphs, ...)` | that list of subsets |
-        | embed | `model.embed(graph)` | all of `{infer_date}`, stride {int(infer_stride.value)} |
+    | step | call | data |
+    |---|---|---|
+    | sample | `Era5Graph(..., sample=N)` | `{train_date.value}` |
+    | build | `builder.build(features, locations)` | the same subsets |
+    | train | `model.training(graphs, ...)` | that list of subsets |
+    | embed | `model.embed(graph)` | all of `{infer_date}`, stride {int(infer_stride.value)} |
 
-        One graph builder subclass, one `NOFE`, and `training` / `embed` for the two directions.
-        `model.net.state_dict()` is the checkpoint if you want to keep the fitted operator.
-        """
-    )
+    One graph builder subclass, one `NOFE`, and `training` / `embed` for the two directions.
+    `model.net.state_dict()` is the checkpoint if you want to keep the fitted operator.
+    """)
     return
 
 
