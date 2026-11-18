@@ -1,0 +1,12 @@
+name: workshop-VIVIT
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pytorch            # CPU / Apple MPS build; see note below for CUDA
+  - pyg                # torch_geometric (Data, NNConv)
+  - jupyterlab         # optional, for notebooks
+  - pip:
+      - kagglehub      # dataset download
