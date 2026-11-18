@@ -4,9 +4,16 @@ channels:
 dependencies:
   - python=3.11
   - pip
-  - numpy
-  - pytorch            # CPU / Apple MPS build; see note below for CUDA
-  - pyg                # torch_geometric (Data, NNConv)
-  - jupyterlab         # optional, for notebooks
+  - numpy>=2
+  - scipy
+  - jupyterlab
   - pip:
-      - kagglehub      # dataset download
+      # For an NVIDIA GPU, keep the next line (cu126 and cu130 also exist);
+      # for CPU only, delete it.
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch>=2.6
+      - torch-geometric>=2.6
+      - transformers
+      - peft
+      - av
+      - kagglehub
