@@ -18,8 +18,8 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from nofe import KernelNN, PointGraph
-from nofe.search import radius_edges
+from ..nofe import KernelNN, PointGraph
+from ..nofe.search import radius_edges
 from peft import LoraConfig, get_peft_model
 from transformers import VivitForVideoClassification
 
@@ -107,9 +107,10 @@ class Hybrid(nn.Module):
 # --------------------------------------------------------------------------- build
 
 
+import re
+
 def is_nofe_param(name: str) -> bool:
-    """True for the new tubelet parameters (the nofe branch and alpha), not the original Conv3d."""
-    return "patch_embeddings" in name and ".orig." not in name
+    return re.search(r"patch_embeddings\.(nofe\.|net\.|alpha)", name) is not None
 
 
 def build_model(
@@ -152,7 +153,7 @@ def build_model(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=["query", "value"],
+        target_modules=["q_proj", "v_proj"],
         modules_to_save=["classifier"],
     )
     model = get_peft_model(model, lora)
