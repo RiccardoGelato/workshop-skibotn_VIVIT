@@ -1,67 +1,27 @@
-"""Fine-tune ViViT (LoRA, optional nofe tubelets) on your own clips.
+"""Fine-tune ViViT (LoRA, optional nofe tubelets) on a Kaggle video dataset.
 
-    python training.py --mode hybrid --train-csv train.csv --val-csv val.csv --num-labels 5
+Run from the repository root, so the ``src`` package is importable:
 
-CSV columns: path,label   (label = integer class id, with a header row)
-Modes: baseline | hybrid | full   (see model.py)
+    python -m src.training.training --mode baseline
+    python -m src.training.training --mode hybrid --max-videos 200 --epochs 1   # quick check
+
+Modes: baseline | hybrid | full   (see src/model/model.py)
+Needs: pip install kagglehub av peft transformers, plus the nofe package.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
+import random
 from pathlib import Path
 
-import av
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from transformers import AutoConfig
 
-from model import MODES, build_model, extra_state, is_nofe_param
-
-
-# --------------------------------------------------------------------------- preprocessing
-
-
-def read_frames(path: str, num_frames: int = 32, stride: int = 4) -> list[np.ndarray]:
-    """Centered clip of ``num_frames`` RGB frames, every ``stride``-th frame.
-
-    Decodes the whole file into memory, which is fine for short clips.
-    """
-    container = av.open(path)
-    frames = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)]
-    total = len(frames)
-    span = num_frames * stride
-    start = max(0, (total - span) // 2)
-    idx = np.clip(np.arange(start, start + span, stride), 0, total - 1)
-    return [frames[i] for i in idx]
-
-
-def preprocess(frames: list[np.ndarray], size: int = 224, resize: int = 256) -> torch.Tensor:
-    """(T, 3, size, size) float tensor in [-1, 1]. Put your own preprocessing here."""
-    x = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float() / 255.0  # (T, 3, H, W)
-    x = F.interpolate(x, size=(resize, resize), mode="bilinear", align_corners=False)
-    top = left = (resize - size) // 2
-    x = x[:, :, top : top + size, left : left + size]
-    return (x - 0.5) / 0.5
-
-
-class ClipDataset(Dataset):
-    def __init__(self, csv_path: str):
-        with open(csv_path, newline="") as fh:
-            rows = list(csv.DictReader(fh))
-        self.paths = [r["path"] for r in rows]
-        self.labels = [int(r["label"]) for r in rows]
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, i: int):
-        return preprocess(read_frames(self.paths[i])), self.labels[i]
-
-
-# --------------------------------------------------------------------------- training
+from ..dataset.clips import ClipDataset, build_manifest, make_label_map, split_items
+from ..dataset.dataset_utils import get_dataset
+from ..model.model import CHECKPOINT, MODES, build_model, extra_state, is_nofe_param
 
 
 def make_optimizer(model, lr: float, lr_nofe: float, weight_decay: float):
@@ -91,8 +51,7 @@ def train(model, train_loader, val_loader, device, *, epochs, lr, lr_nofe, weigh
     optimizer = make_optimizer(model, lr, lr_nofe, weight_decay)
     use_amp = amp and device.type == "cuda"
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
-    best = -1.0
-    best_state = None
+    best, best_state = -1.0, None
     for epoch in range(1, epochs + 1):
         model.train()
         running = 0.0
@@ -121,9 +80,10 @@ def train(model, train_loader, val_loader, device, *, epochs, lr, lr_nofe, weigh
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=MODES, default="hybrid")
-    ap.add_argument("--train-csv", required=True)
-    ap.add_argument("--val-csv")
-    ap.add_argument("--num-labels", type=int, required=True)
+    ap.add_argument("--dataset", default="kinetics-train-5per", help="REGISTRY name or owner/dataset")
+    ap.add_argument("--data-dir", help="use this folder instead of downloading")
+    ap.add_argument("--val-fraction", type=float, default=0.1)
+    ap.add_argument("--max-videos", type=int, help="random subset, for quick tests")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1e-4, help="LoRA and classifier")
@@ -132,18 +92,30 @@ def main():
     ap.add_argument("--lora-r", type=int, default=8)
     ap.add_argument("--width", type=int, default=8, help="KernelNN width; memory grows with width^2")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="bfloat16 autocast on CUDA")
     ap.add_argument("--out", default="runs/vivit_lora")
     args = ap.parse_args()
 
+    root = Path(args.data_dir) if args.data_dir else get_dataset(args.dataset)
+    items = build_manifest(root)
+    if args.max_videos and args.max_videos < len(items):
+        items = random.Random(args.seed).sample(items, args.max_videos)
+
+    cfg = AutoConfig.from_pretrained(CHECKPOINT)
+    label_of, num_labels = make_label_map({c for _, c in items}, cfg.label2id)
+    print(f"{len(items)} videos, {len(label_of)} classes, head with {num_labels} outputs "
+          f"({'pretrained Kinetics-400 labels' if num_labels == cfg.num_labels else 'new head'})")
+    train_items, val_items = split_items(items, args.val_fraction, args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(args.num_labels, args.mode, lora_r=args.lora_r, width=args.width).to(device)
+    model = build_model(num_labels, args.mode, lora_r=args.lora_r, width=args.width).to(device)
     model.print_trainable_parameters()
 
-    train_loader = DataLoader(ClipDataset(args.train_csv), batch_size=args.batch_size,
+    train_loader = DataLoader(ClipDataset(train_items, label_of), batch_size=args.batch_size,
                               shuffle=True, num_workers=args.workers)
-    val_loader = (DataLoader(ClipDataset(args.val_csv), batch_size=args.batch_size,
-                             num_workers=args.workers) if args.val_csv else None)
+    val_loader = (DataLoader(ClipDataset(val_items, label_of), batch_size=args.batch_size,
+                             num_workers=args.workers) if val_items else None)
 
     train(model, train_loader, val_loader, device, epochs=args.epochs, lr=args.lr,
           lr_nofe=args.lr_nofe, weight_decay=args.weight_decay, amp=args.amp)
