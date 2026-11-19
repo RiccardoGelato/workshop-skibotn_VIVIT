@@ -24,13 +24,19 @@ from ..dataset.dataset_utils import get_dataset
 from ..model.model import CHECKPOINT, MODES, build_model, extra_state, is_nofe_param
 
 
-def make_optimizer(model, lr: float, lr_nofe: float, weight_decay: float):
-    """LoRA and classifier at ``lr``; the new tubelet module (trained from scratch) at ``lr_nofe``."""
-    nofe, rest = [], []
+def make_optimizer(model, lr: float, lr_nofe: float, lr_head: float, weight_decay: float):
+    """LoRA at ``lr``; the new classifier at ``lr_head``; the new tubelet module at ``lr_nofe``."""
+    nofe, head, rest = [], [], []
     for name, param in model.named_parameters():
-        if param.requires_grad:
-            (nofe if is_nofe_param(name) else rest).append(param)
-    groups = [{"params": rest, "lr": lr}]
+        if not param.requires_grad:
+            continue
+        if is_nofe_param(name):
+            nofe.append(param)
+        elif "classifier" in name:
+            head.append(param)
+        else:
+            rest.append(param)
+    groups = [{"params": rest, "lr": lr}, {"params": head, "lr": lr_head}]
     if nofe:
         groups.append({"params": nofe, "lr": lr_nofe})
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
@@ -47,8 +53,8 @@ def evaluate(model, loader, device) -> float:
     return correct / max(total, 1)
 
 
-def train(model, train_loader, val_loader, device, *, epochs, lr, lr_nofe, weight_decay, amp):
-    optimizer = make_optimizer(model, lr, lr_nofe, weight_decay)
+def train(model, train_loader, val_loader, device, *, epochs, lr, lr_nofe, lr_head, weight_decay, amp):
+    optimizer = make_optimizer(model, lr, lr_nofe, lr_head, weight_decay)
     use_amp = amp and device.type == "cuda"
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     best, best_state = -1.0, None
@@ -95,6 +101,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="bfloat16 autocast on CUDA")
     ap.add_argument("--out", default="runs/vivit_lora")
+    ap.add_argument("--lr-head", type=float, default=1e-3, help="new classifier head")
     args = ap.parse_args()
 
     root = Path(args.data_dir) if args.data_dir else get_dataset(args.dataset)
@@ -118,7 +125,7 @@ def main():
                              num_workers=args.workers) if val_items else None)
 
     train(model, train_loader, val_loader, device, epochs=args.epochs, lr=args.lr,
-          lr_nofe=args.lr_nofe, weight_decay=args.weight_decay, amp=args.amp)
+        lr_nofe=args.lr_nofe, lr_head=args.lr_head, weight_decay=args.weight_decay, amp=args.amp)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
